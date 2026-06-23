@@ -33,11 +33,6 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
-      - name: Generate icons
-        run: |
-          pip install Pillow --quiet
-          python tools/generate_logo.py
-
       - name: Check formatting
         run: cargo fmt --all -- --check
 

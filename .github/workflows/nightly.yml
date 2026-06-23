@@ -37,11 +37,6 @@ jobs:
           key: ${{ runner.os }}-${{ matrix.target }}-nightly-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-${{ matrix.target }}-nightly-cargo-
 
-      - name: Generate icons
-        run: |
-          pip install Pillow --quiet
-          python tools/generate_logo.py
-
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
 
