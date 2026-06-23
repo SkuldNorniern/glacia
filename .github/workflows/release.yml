@@ -1,0 +1,151 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: glacia.exe
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ matrix.target }}-cargo-
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package and checksum
+        shell: bash
+        run: |
+          BINARY=target/${{ matrix.target }}/release/${{ matrix.artifact }}
+          ARCHIVE=glacia-${{ github.ref_name }}-${{ matrix.target }}
+
+          mkdir -p dist
+          cp "$BINARY" dist/
+          cd dist && 7z a "../${ARCHIVE}.zip" ${{ matrix.artifact }} && cd ..
+          sha256sum "${ARCHIVE}.zip" > "${ARCHIVE}.zip.sha256"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: glacia-${{ matrix.target }}
+          path: |
+            *.zip
+            *.zip.sha256
+          if-no-files-found: error
+
+  release:
+    name: Publish Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate changelog
+        run: |
+          PREV_TAG=$(git tag -l 'v*' --sort=-v:refname | grep -v "^${GITHUB_REF_NAME}$" | head -1 || true)
+          RANGE="${PREV_TAG:+${PREV_TAG}..HEAD}"
+          [ -z "$PREV_TAG" ] && RANGE="HEAD"
+
+          section() {
+            git log "$RANGE" --pretty=format:"%s" \
+              | grep -E "^${1}(\([^)]*\))?: " \
+              | sed -E "s/^${1}(\([^)]*\))?: /- /" \
+              || true
+          }
+
+          FEATS=$(section feat)
+          FIXES=$(section fix)
+          DOCS=$(section docs)
+          REFACTORS=$(section refactor)
+          CI=$(section ci)
+          OTHERS=$(git log "$RANGE" --pretty=format:"%s" \
+            | grep -Ev "^(feat|fix|docs|refactor|ci|chore|style|test|perf|build)(\([^)]*\))?: " \
+            || true)
+
+          {
+            echo "## What's Changed"
+            echo ""
+            if [ -n "$FEATS" ];     then echo "### Features";      echo "$FEATS";     echo ""; fi
+            if [ -n "$FIXES" ];     then echo "### Bug Fixes";     echo "$FIXES";     echo ""; fi
+            if [ -n "$DOCS" ];      then echo "### Documentation"; echo "$DOCS";      echo ""; fi
+            if [ -n "$REFACTORS" ]; then echo "### Refactor";      echo "$REFACTORS"; echo ""; fi
+            if [ -n "$CI" ];        then echo "### CI";            echo "$CI";        echo ""; fi
+            if [ -n "$OTHERS" ];    then echo "### Other";         echo "$OTHERS" | sed 's/^/- /'; echo ""; fi
+          } > CHANGELOG.md
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Merge checksums
+        run: find artifacts -name "*.sha256" -exec cat {} \; | sort > checksums.sha256
+
+      - name: Publish release
+        uses: marvinpinto/action-automatic-releases@latest
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          automatic_release_tag: ${{ github.ref_name }}
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          title: "Glacia ${{ github.ref_name }}"
+          files: |
+            artifacts/*.zip
+            checksums.sha256
+
+      - name: Update release notes with changelog and downloads table
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          {
+            cat CHANGELOG.md
+            echo ""
+            echo "---"
+            echo ""
+            echo "### Downloads"
+            echo ""
+            echo "| Platform | File | SHA256 |"
+            echo "|----------|------|--------|"
+            while read -r hash file; do
+              case "$file" in
+                *windows*) platform="Windows x86_64" ;;
+                *)         platform="Other"           ;;
+              esac
+              echo "| $platform | \`$file\` | \`${hash:0:16}...\` |"
+            done < checksums.sha256
+          } > notes.md
+          gh release edit ${{ github.ref_name }} --notes-file notes.md
