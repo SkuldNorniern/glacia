@@ -17,6 +17,8 @@ use crate::platform;
 pub struct WindowConfig {
     pub width: u32,
     pub height: u32,
+    /// Uniform padding in pixels between the window edge and the terminal grid.
+    pub padding: u32,
 }
 
 impl Default for WindowConfig {
@@ -24,6 +26,7 @@ impl Default for WindowConfig {
         Self {
             width: 1280,
             height: 800,
+            padding: 4,
         }
     }
 }
@@ -129,6 +132,9 @@ impl Config {
             if let Some(v) = as_u32(window.get("height")) {
                 config.window.height = v.max(1);
             }
+            if let Some(v) = as_u32(window.get("padding")) {
+                config.window.padding = v.min(64);
+            }
         }
 
         if let Some(font) = table.get("font").and_then(Value::as_table) {
@@ -230,8 +236,9 @@ fn write_default_template(path: &Path) -> Option<String> {
 # All commented-out values are the built-in defaults.
 
 [window]
-# width  = 1280
-# height = 800
+# width   = 1280
+# height  = 800
+# padding = 4
 
 [font]
 # family      = \"{default_font}\"  # \"auto\" uses the platform default monospace
