@@ -179,6 +179,16 @@ fn main() -> AureaResult<()> {
                         }
                     }
                 }
+                WindowEvent::MouseWheel { delta_y, .. } => {
+                    let lines = (delta_y.abs() * 3.0).ceil() as usize;
+                    if *delta_y < 0.0 {
+                        let max_scroll = term.scrollback_rows().len();
+                        scroll_offset = (scroll_offset + lines).min(max_scroll);
+                    } else {
+                        scroll_offset = scroll_offset.saturating_sub(lines);
+                    }
+                    needs_redraw = true;
+                }
                 WindowEvent::TextInput { text } => {
                     let printable: String = text.chars().filter(|c| !c.is_control()).collect();
                     if !printable.is_empty() {
