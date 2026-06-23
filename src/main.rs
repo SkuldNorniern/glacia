@@ -235,14 +235,25 @@ fn main() -> AureaResult<()> {
                         let visible_rows =
                             (window_size.1 as f32 / metrics.height).max(1.0) as usize;
                         let scroll_page = visible_rows / 2;
+                        let max_scroll = term.scrollback_rows().len();
                         match key {
                             KeyCode::PageUp => {
-                                let max_scroll = term.scrollback_rows().len();
                                 scroll_offset = (scroll_offset + scroll_page).min(max_scroll);
                                 needs_redraw = true;
                             }
                             KeyCode::PageDown => {
                                 scroll_offset = scroll_offset.saturating_sub(scroll_page);
+                                needs_redraw = true;
+                            }
+                            // Home jumps to the oldest scrollback line.
+                            KeyCode::Home if scroll_offset < max_scroll => {
+                                scroll_offset = max_scroll;
+                                needs_redraw = true;
+                            }
+                            // End snaps back to the live view; if already live
+                            // the key falls through to the PTY as normal.
+                            KeyCode::End if scroll_offset > 0 => {
+                                scroll_offset = 0;
                                 needs_redraw = true;
                             }
                             _ => {
@@ -259,9 +270,15 @@ fn main() -> AureaResult<()> {
                 }
                 WindowEvent::MouseWheel { delta_y, .. } => {
                     if term.is_alt_screen() {
-                        // App manages scrolling — don't steal mouse wheel for
-                        // Glacia's viewport. Forwarding mouse wheel events as
-                        // proper X10/SGR mouse reports is future work.
+                        // Forward wheel as arrow-key repeats so vim/less/htop
+                        // scroll naturally. The app sees the same sequences it
+                        // would receive from keyboard arrow presses.
+                        let lines = (delta_y.abs() * 3.0).ceil() as usize;
+                        let seq = if *delta_y < 0.0 { "\x1b[A" } else { "\x1b[B" };
+                        for _ in 0..lines {
+                            let _ = term.write_str(seq);
+                        }
+                        needs_redraw = true;
                     } else {
                         let lines = (delta_y.abs() * 3.0).ceil() as usize;
                         if *delta_y < 0.0 {
