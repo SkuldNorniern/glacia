@@ -14,6 +14,42 @@ use vanta::{Cell, CellKind};
 use crate::config::CursorShape;
 use crate::theme;
 
+/// Normalized selection range in screen-cell coordinates.
+/// `start` is always ≤ `end` in row-major order after construction via [`SelectionRange::new`].
+#[derive(Clone, Copy)]
+pub struct SelectionRange {
+    pub start: (usize, usize),
+    pub end: (usize, usize),
+}
+
+impl SelectionRange {
+    /// Build a normalized range: if `a > b` they are swapped so `start ≤ end`.
+    pub fn new(a: (usize, usize), b: (usize, usize)) -> Self {
+        if a <= b {
+            Self { start: a, end: b }
+        } else {
+            Self { start: b, end: a }
+        }
+    }
+
+    /// Column range `[start_col, end_col]` for a given row, or `None` if the
+    /// row falls outside the selection.
+    pub fn cols_for_row(&self, row: usize, row_len: usize) -> Option<(usize, usize)> {
+        let (r1, c1) = self.start;
+        let (r2, c2) = self.end;
+        if row < r1 || row > r2 {
+            return None;
+        }
+        let sc = if row == r1 { c1 } else { 0 };
+        let ec = if row == r2 {
+            c2
+        } else {
+            row_len.saturating_sub(1)
+        };
+        Some((sc, ec))
+    }
+}
+
 pub struct CellMetrics {
     pub width: f32,
     pub height: f32,
@@ -249,6 +285,7 @@ fn cell_needs_fallback(cell: &Cell, fonts: &RowFonts) -> bool {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_row(
     ctx: &mut dyn DrawingContext,
     row: &[Cell],
@@ -256,11 +293,13 @@ fn draw_row(
     baseline: f32,
     metrics: &CellMetrics,
     fonts: &RowFonts,
+    x_offset: f32,
+    sel_cols: Option<(usize, usize)>,
 ) -> AureaResult<()> {
     // Pass 1: cell backgrounds
     for (i, cell) in row.iter().enumerate() {
         if let (_, Some(bg)) = resolve_pair(cell) {
-            let x = i as f32 * metrics.width;
+            let x = i as f32 * metrics.width + x_offset;
             ctx.draw_rect(
                 Rect::new(x, y_top, metrics.width, metrics.height),
                 &solid(bg),
@@ -268,7 +307,21 @@ fn draw_row(
         }
     }
 
-    // Pass 2: text runs — batched by (fg, bold, italic, fallback) for fewer draw calls
+    // Pass 2: selection highlight (drawn on top of any explicit cell BG)
+    if let Some((sc, ec)) = sel_cols {
+        for i in sc..=ec {
+            if i >= row.len() {
+                break;
+            }
+            let x = i as f32 * metrics.width + x_offset;
+            ctx.draw_rect(
+                Rect::new(x, y_top, metrics.width, metrics.height),
+                &solid(theme::SELECTION),
+            )?;
+        }
+    }
+
+    // Pass 3: text runs — batched by (fg, bold, italic, fallback) for fewer draw calls
     let mut i = 0usize;
     while i < row.len() {
         let (fg, _) = resolve_pair(&row[i]);
@@ -289,7 +342,7 @@ fn draw_row(
         if text.trim_end().is_empty() {
             continue;
         }
-        let x = start as f32 * metrics.width;
+        let x = start as f32 * metrics.width + x_offset;
         ctx.draw_text_with_font(
             &text,
             Point::new(x, baseline),
@@ -298,12 +351,11 @@ fn draw_row(
         )?;
     }
 
-    // Pass 3: underlines and strikethroughs — drawn as thin rects after text so
-    // they sit on top of any background fills and below the text layer.
-    let ul_y = baseline + 2.0; // just below the text baseline
-    let st_y = baseline - metrics.ascent * 0.35; // roughly middle of cap height
+    // Pass 4: underlines and strikethroughs
+    let ul_y = baseline + 2.0;
+    let st_y = baseline - metrics.ascent * 0.35;
     for (i, cell) in row.iter().enumerate() {
-        let x = i as f32 * metrics.width;
+        let x = i as f32 * metrics.width + x_offset;
         if cell.attrs.contains(Attrs::UNDERLINE) {
             let ul_color = match cell.underline_color {
                 TermColor::Default => resolve_pair(cell).0,
@@ -321,6 +373,9 @@ fn draw_row(
 }
 
 /// Draw the full visible grid, then the cursor on top if `cursor_visible`.
+/// `padding` offsets every cell from the window edge.
+/// `selection` highlights the covered cells with the selection background.
+#[allow(clippy::too_many_arguments)]
 pub fn draw_grid(
     ctx: &mut dyn DrawingContext,
     rows: &[Vec<Cell>],
@@ -329,13 +384,16 @@ pub fn draw_grid(
     metrics: &CellMetrics,
     fonts: &RowFonts,
     cursor_shape: &CursorShape,
+    padding: f32,
+    selection: Option<SelectionRange>,
 ) -> AureaResult<()> {
     ctx.clear(theme::BACKGROUND)?;
 
     let line_h = metrics.height;
 
     for (row_idx, row) in rows.iter().enumerate() {
-        let y_top = row_idx as f32 * line_h;
+        let y_top = row_idx as f32 * line_h + padding;
+        let sel_cols = selection.and_then(|s| s.cols_for_row(row_idx, row.len()));
         draw_row(
             ctx,
             row,
@@ -343,21 +401,22 @@ pub fn draw_grid(
             y_top + metrics.baseline_offset,
             metrics,
             fonts,
+            padding,
+            sel_cols,
         )?;
     }
 
     if cursor_visible {
         let (row, col) = cursor;
         if row < rows.len() {
-            let x = col as f32 * metrics.width;
-            let y = row as f32 * line_h;
+            let x = col as f32 * metrics.width + padding;
+            let y = row as f32 * line_h + padding;
             match cursor_shape {
                 CursorShape::Block => {
                     ctx.draw_rect(
                         Rect::new(x, y, metrics.width, line_h),
                         &solid(theme::CURSOR),
                     )?;
-                    // Redraw the character on top of the block with inverted colours.
                     if col < rows[row].len() {
                         let cell = &rows[row][col];
                         let mut text = String::new();
@@ -377,11 +436,9 @@ pub fn draw_grid(
                     }
                 }
                 CursorShape::Beam => {
-                    // 2 px wide vertical bar at the left edge
                     ctx.draw_rect(Rect::new(x, y, 2.0, line_h), &solid(theme::CURSOR))?;
                 }
                 CursorShape::Underline => {
-                    // 2 px high horizontal bar at the bottom of the cell
                     ctx.draw_rect(
                         Rect::new(x, y + line_h - 2.0, metrics.width, 2.0),
                         &solid(theme::CURSOR),

@@ -8,6 +8,7 @@ use vanta::Color as TermColor;
 pub const BACKGROUND: Color = Color::rgb(16, 18, 24);
 pub const FOREGROUND: Color = Color::rgb(216, 222, 233);
 pub const CURSOR: Color = Color::rgb(255, 255, 255);
+pub const SELECTION: Color = Color::rgb(58, 79, 138);
 
 const ANSI16: [Color; 16] = [
     Color::rgb(27, 29, 36),    // black
