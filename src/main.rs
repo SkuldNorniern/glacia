@@ -180,6 +180,10 @@ fn main() -> AureaResult<()> {
     // redraws manually via `canvas.draw()`: without one, OS-initiated
     // repaints (e.g. the window's first paint) have nothing to call back
     // into and the surface stays blank.
+    // canvas.draw() always clears to background_color before our closure runs;
+    // setting it here means both the retained-mode callback and our imperative
+    // draw path start from the correct dark color — no redundant white clear.
+    raw_canvas.set_background_color(theme::BACKGROUND);
     raw_canvas.set_draw_callback(|ctx| ctx.clear(theme::BACKGROUND))?;
     let canvas_arc = Arc::new(Mutex::new(SendableCanvas(raw_canvas)));
     window.set_content(SharedCanvas(canvas_arc.clone()))?;
@@ -250,6 +254,14 @@ fn main() -> AureaResult<()> {
                     scroll_offset = 0;
                     sel_anchor = None;
                     sel_end = None;
+                    last_render = Instant::now()
+                        .checked_sub(FRAME_INTERVAL)
+                        .unwrap_or(Instant::now());
+                    needs_redraw = true;
+                }
+                WindowEvent::ScaleFactorChanged { .. } => {
+                    // Let the canvas sync loop pick up the new logical dimensions
+                    // on the next iteration — nothing to do explicitly here.
                     needs_redraw = true;
                 }
                 WindowEvent::MouseButton {
@@ -418,6 +430,21 @@ fn main() -> AureaResult<()> {
         }
         if should_close {
             break;
+        }
+
+        // Sync window_size with the canvas's actual rendered dimensions each frame.
+        // canvas.draw() calls check_and_resize() internally, so canvas.size() reflects
+        // the real platform allocation — which may differ from config or Resized events
+        // by a few pixels (title-bar inclusion, DPI rounding). Using stale dimensions
+        // makes the grid slightly too large, causing the last row/column to be clipped.
+        {
+            let actual = lock(canvas_arc.as_ref()).size();
+            if actual.0 > 0 && actual.1 > 0 && actual != window_size {
+                window_size = actual;
+                let (nc, nr) = grid_size(actual.0, actual.1, &metrics, padding);
+                let _ = term.resize(nc, nr);
+                needs_redraw = true;
+            }
         }
 
         if term.sync() {
