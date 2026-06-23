@@ -114,6 +114,11 @@ fn main() -> AureaResult<()> {
     window.set_content(SharedCanvas(canvas_arc.clone()))?;
 
     let font = Font::new(&config.font.family, config.font.size);
+    let fallback_font: Option<Font> = if config.font.fallback.is_empty() {
+        None
+    } else {
+        Some(Font::new(&config.font.fallback, config.font.size))
+    };
     let metrics = cell_metrics(&config, &canvas_arc, &font);
     let (cols, rows) = grid_size(config.window.width, config.window.height, &metrics);
     let mut term = match TerminalSession::spawn(SpawnOverrides {
@@ -248,6 +253,7 @@ fn main() -> AureaResult<()> {
                         cursor_visible,
                         &metrics,
                         &font,
+                        fallback_font.as_ref(),
                     )?;
                 } else {
                     let sb = term.scrollback_rows();
@@ -271,6 +277,7 @@ fn main() -> AureaResult<()> {
                         false,
                         &metrics,
                         &font,
+                        fallback_font.as_ref(),
                     )?;
                 }
                 if let Some(message) = diagnostics.first() {

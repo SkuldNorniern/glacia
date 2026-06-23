@@ -29,6 +29,9 @@ impl Default for WindowConfig {
 #[derive(Debug, Clone)]
 pub struct FontConfig {
     pub family: String,
+    /// Secondary font tried for wide/CJK characters the primary lacks.
+    /// Empty means no explicit fallback (let the OS/DirectWrite choose).
+    pub fallback: String,
     pub size: f32,
     pub line_height: f32,
 }
@@ -37,6 +40,7 @@ impl Default for FontConfig {
     fn default() -> Self {
         Self {
             family: "Consolas".to_owned(),
+            fallback: String::new(),
             size: 14.0,
             line_height: 1.25,
         }
@@ -119,6 +123,11 @@ impl Config {
                 && !v.trim().is_empty()
             {
                 config.font.family = v.to_owned();
+            }
+            if let Some(v) = font.get("fallback").and_then(Value::as_str)
+                && !v.trim().is_empty()
+            {
+                config.font.fallback = v.to_owned();
             }
             if let Some(v) = as_f32(font.get("size"))
                 && v > 0.0
