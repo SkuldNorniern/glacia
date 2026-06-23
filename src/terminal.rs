@@ -3,6 +3,7 @@
 //! Glacia's calls into Vanta funnel through here so the migration tracked in
 //! `PLAN.md`'s "Vanta API Contract" table only ever touches this one file.
 
+use std::ffi::OsString;
 use std::io;
 
 use vanta::pty::SpawnConfig;
@@ -15,6 +16,8 @@ pub struct TerminalSession {
     cells: Vec<Vec<Cell>>,
     cursor: (usize, usize),
     cursor_visible: bool,
+    is_alt_screen: bool,
+    bracketed_paste: bool,
 }
 
 /// Overrides for the spawned shell. Empty `shell`/`working_directory` mean
@@ -31,7 +34,7 @@ impl TerminalSession {
         let config = SpawnConfig {
             cols: overrides.cols,
             rows: overrides.rows,
-            program: (!overrides.shell.is_empty()).then(|| overrides.shell.to_owned()),
+            program: (!overrides.shell.is_empty()).then(|| OsString::from(overrides.shell)),
             cwd: (!overrides.working_directory.is_empty())
                 .then(|| overrides.working_directory.into()),
             ..SpawnConfig::default()
@@ -44,6 +47,8 @@ impl TerminalSession {
             cells: Vec::new(),
             cursor: (0, 0),
             cursor_visible: true,
+            is_alt_screen: false,
+            bracketed_paste: false,
         })
     }
 
@@ -62,6 +67,8 @@ impl TerminalSession {
         self.scrollback = snapshot.scrollback;
         self.cells = snapshot.screen;
         self.cursor_visible = snapshot.cursor_visible;
+        self.is_alt_screen = snapshot.is_alt_screen;
+        self.bracketed_paste = snapshot.bracketed_paste;
         true
     }
 
@@ -81,6 +88,19 @@ impl TerminalSession {
     /// TUI apps like vim hide it to avoid a second cursor block.
     pub fn app_cursor_visible(&self) -> bool {
         self.cursor_visible
+    }
+
+    /// Whether the terminal app is on the alternate screen (DECSET 47/1049).
+    /// When true, Glacia's scrollback viewport should be suppressed — the app
+    /// manages its own scrolling (vim, htop, less, etc.).
+    pub fn is_alt_screen(&self) -> bool {
+        self.is_alt_screen
+    }
+
+    /// Whether bracketed paste mode (DECSET 2004) is enabled.
+    /// When true, clipboard pastes must be wrapped in ESC[200~ … ESC[201~.
+    pub fn bracketed_paste_enabled(&self) -> bool {
+        self.bracketed_paste
     }
 
     pub fn write_str(&self, s: &str) -> io::Result<()> {
