@@ -148,6 +148,7 @@ fn main() -> AureaResult<()> {
                     window_size = (*width, *height);
                     let (cols, rows) = grid_size(*width, *height, &metrics);
                     let _ = term.resize(cols, rows);
+                    scroll_offset = 0;
                     needs_redraw = true;
                 }
                 WindowEvent::KeyInput {
