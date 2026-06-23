@@ -1,6 +1,7 @@
 mod canvas;
 mod config;
 mod input;
+mod platform;
 mod render_cpu;
 mod terminal;
 mod theme;
@@ -15,7 +16,7 @@ use aurea::{AureaResult, KeyCode, Window, WindowEvent};
 
 use canvas::{SendableCanvas, SharedCanvas, lock};
 use config::Config;
-use render_cpu::CellMetrics;
+use render_cpu::{CellMetrics, RowFonts};
 use terminal::{SpawnOverrides, TerminalSession};
 use vanta::Cell;
 
@@ -113,13 +114,17 @@ fn main() -> AureaResult<()> {
     let canvas_arc = Arc::new(Mutex::new(SendableCanvas(raw_canvas)));
     window.set_content(SharedCanvas(canvas_arc.clone()))?;
 
-    let font = Font::new(&config.font.family, config.font.size);
-    let fallback_font: Option<Font> = if config.font.fallback.is_empty() {
+    // Build fonts once. RowFonts owns the bold variants so they are not
+    // re-cloned on every frame.
+    let primary_font = Font::new(&config.font.family, config.font.size);
+    let fallback_font = if config.font.fallback.is_empty() {
         None
     } else {
         Some(Font::new(&config.font.fallback, config.font.size))
     };
-    let metrics = cell_metrics(&config, &canvas_arc, &font);
+    let metrics = cell_metrics(&config, &canvas_arc, &primary_font);
+    let row_fonts = RowFonts::new(primary_font, fallback_font);
+
     let (cols, rows) = grid_size(config.window.width, config.window.height, &metrics);
     let mut term = match TerminalSession::spawn(SpawnOverrides {
         cols,
@@ -130,7 +135,7 @@ fn main() -> AureaResult<()> {
         Ok(term) => term,
         Err(err) => {
             let message = format!("failed to spawn default shell: {err}");
-            return wait_for_close_with_message(&window, &canvas_arc, &font, &message);
+            return wait_for_close_with_message(&window, &canvas_arc, &row_fonts.primary, &message);
         }
     };
 
@@ -244,13 +249,13 @@ fn main() -> AureaResult<()> {
         }
 
         if needs_redraw {
+            let visible_rows = (window_size.1 as f32 / metrics.height).max(1.0) as usize;
             let mut canvas = lock(canvas_arc.as_ref());
             // `canvas.draw()` invalidates the native surface itself; an extra
             // `invalidate_all()` here would trigger a second native repaint
             // that re-runs the registered `set_draw_callback` (background
             // only) and clobbers this frame's real content.
             canvas.draw(|ctx| {
-                let visible_rows = (window_size.1 as f32 / metrics.height).max(1.0) as usize;
                 if scroll_offset == 0 {
                     render_cpu::draw_grid(
                         ctx,
@@ -258,8 +263,7 @@ fn main() -> AureaResult<()> {
                         term.cursor(),
                         cursor_visible,
                         &metrics,
-                        &font,
-                        fallback_font.as_ref(),
+                        &row_fonts,
                     )?;
                 } else {
                     let sb = term.scrollback_rows();
@@ -282,8 +286,7 @@ fn main() -> AureaResult<()> {
                         (usize::MAX, usize::MAX),
                         false,
                         &metrics,
-                        &font,
-                        fallback_font.as_ref(),
+                        &row_fonts,
                     )?;
                 }
                 if let Some(message) = diagnostics.first() {
@@ -292,7 +295,7 @@ fn main() -> AureaResult<()> {
                         message,
                         window_size.0 as f32,
                         window_size.1 as f32,
-                        &font,
+                        &row_fonts.primary,
                     )?;
                 }
                 Ok(())

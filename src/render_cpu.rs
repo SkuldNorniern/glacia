@@ -14,6 +14,46 @@ pub struct CellMetrics {
     pub height: f32,
 }
 
+/// Font set for one rendered frame: primary, bold, and their fallback
+/// counterparts for CJK/emoji runs.
+///
+/// Built once from the loaded `Font` objects and reused every frame — avoids
+/// cloning font family strings on the hot path.
+pub struct RowFonts {
+    pub primary: Font,
+    bold: Font,
+    pub fallback: Option<Font>,
+    bold_fallback: Option<Font>,
+}
+
+impl RowFonts {
+    pub fn new(primary: Font, fallback: Option<Font>) -> Self {
+        let bold = Font {
+            weight: FontWeight::Bold,
+            ..primary.clone()
+        };
+        let bold_fallback = fallback.as_ref().map(|f| Font {
+            weight: FontWeight::Bold,
+            ..f.clone()
+        });
+        Self {
+            primary,
+            bold,
+            fallback,
+            bold_fallback,
+        }
+    }
+
+    fn pick(&self, bold: bool, use_fallback: bool) -> &Font {
+        match (bold, use_fallback) {
+            (true, true) => self.bold_fallback.as_ref().unwrap_or(&self.bold),
+            (true, false) => &self.bold,
+            (false, true) => self.fallback.as_ref().unwrap_or(&self.primary),
+            (false, false) => &self.primary,
+        }
+    }
+}
+
 fn solid(color: Color) -> Paint {
     Paint {
         color,
@@ -69,47 +109,12 @@ fn prefers_fallback(c: char) -> bool {
     )
 }
 
-/// True if every displayable character in the cell should use the fallback font.
+/// True if the cell's content should use the fallback font.
 fn cell_prefers_fallback(cell: &Cell) -> bool {
     match &cell.kind {
         CellKind::Char(c) => prefers_fallback(*c),
         CellKind::Cluster(s) => s.chars().any(prefers_fallback),
         _ => false,
-    }
-}
-
-struct RowFonts<'a> {
-    primary: &'a Font,
-    bold: Font,
-    fallback: Option<&'a Font>,
-    bold_fallback: Option<Font>,
-}
-
-impl<'a> RowFonts<'a> {
-    fn new(primary: &'a Font, fallback: Option<&'a Font>) -> Self {
-        let bold = Font {
-            weight: FontWeight::Bold,
-            ..primary.clone()
-        };
-        let bold_fallback = fallback.map(|f| Font {
-            weight: FontWeight::Bold,
-            ..f.clone()
-        });
-        Self {
-            primary,
-            bold,
-            fallback,
-            bold_fallback,
-        }
-    }
-
-    fn pick(&self, bold: bool, use_fallback: bool) -> &Font {
-        match (bold, use_fallback) {
-            (true, true) => self.bold_fallback.as_ref().unwrap_or(&self.bold),
-            (true, false) => &self.bold,
-            (false, true) => self.fallback.unwrap_or(self.primary),
-            (false, false) => self.primary,
-        }
     }
 }
 
@@ -119,7 +124,7 @@ fn draw_row(
     y_top: f32,
     baseline: f32,
     metrics: &CellMetrics,
-    fonts: &RowFonts<'_>,
+    fonts: &RowFonts,
 ) -> AureaResult<()> {
     for (i, cell) in row.iter().enumerate() {
         if let (_, Some(bg)) = resolve_pair(cell) {
@@ -150,8 +155,12 @@ fn draw_row(
             continue;
         }
         let x = start as f32 * metrics.width;
-        let run_font = fonts.pick(bold, use_fallback);
-        ctx.draw_text_with_font(&text, Point::new(x, baseline), run_font, &solid(fg))?;
+        ctx.draw_text_with_font(
+            &text,
+            Point::new(x, baseline),
+            fonts.pick(bold, use_fallback),
+            &solid(fg),
+        )?;
     }
 
     Ok(())
@@ -164,18 +173,16 @@ pub fn draw_grid(
     cursor: (usize, usize),
     cursor_visible: bool,
     metrics: &CellMetrics,
-    font: &Font,
-    fallback_font: Option<&Font>,
+    fonts: &RowFonts,
 ) -> AureaResult<()> {
     ctx.clear(theme::BACKGROUND)?;
 
-    let fonts = RowFonts::new(font, fallback_font);
     let line_h = metrics.height;
     let baseline_offset = line_h * 0.8;
 
     for (row_idx, row) in rows.iter().enumerate() {
         let y_top = row_idx as f32 * line_h;
-        draw_row(ctx, row, y_top, y_top + baseline_offset, metrics, &fonts)?;
+        draw_row(ctx, row, y_top, y_top + baseline_offset, metrics, fonts)?;
     }
 
     if cursor_visible {

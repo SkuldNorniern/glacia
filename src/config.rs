@@ -3,13 +3,15 @@
 //! never blocks startup — it falls back to defaults and reports a
 //! diagnostic instead.
 
-use std::env::var_os;
 use std::fs::read_to_string;
-use std::path::PathBuf;
+use std::fs::{create_dir_all, write as write_file};
+use std::path::Path;
 
 use toml::Table;
 use toml::Value;
 use toml::de::Error as TomlError;
+
+use crate::platform;
 
 #[derive(Debug, Clone)]
 pub struct WindowConfig {
@@ -39,7 +41,7 @@ pub struct FontConfig {
 impl Default for FontConfig {
     fn default() -> Self {
         Self {
-            family: "Consolas".to_owned(),
+            family: platform::default_primary_font().to_owned(),
             fallback: String::new(),
             size: 14.0,
             line_height: 1.25,
@@ -162,15 +164,19 @@ impl Config {
         (config, None)
     }
 
-    /// Load from the platform user config path if it exists, otherwise
-    /// return defaults. Returns the resolved config plus a human-readable
-    /// diagnostic if a config file existed but couldn't be read or parsed.
+    /// Load from the platform user config path if it exists. On first launch
+    /// (no file present), writes a commented template for the user to edit.
+    /// Returns the resolved config plus a human-readable diagnostic if a
+    /// config file existed but couldn't be read or parsed, or if the
+    /// first-launch template write failed.
     pub fn load() -> (Self, Option<String>) {
-        let Some(path) = user_config_path() else {
+        let Some(path) = platform::user_config_path() else {
             return (Self::default(), None);
         };
         if !path.exists() {
-            return (Self::default(), None);
+            let diagnostic = write_default_template(&path)
+                .map(|e| format!("could not write default config: {e}"));
+            return (Self::default(), diagnostic);
         }
         match read_to_string(&path) {
             Ok(text) => {
@@ -187,15 +193,45 @@ impl Config {
     }
 }
 
-/// `%APPDATA%\glacia\config.toml` on Windows, `$XDG_CONFIG_HOME/glacia/config.toml`
-/// (falling back to `~/.config/...`) elsewhere.
-fn user_config_path() -> Option<PathBuf> {
-    let base = if cfg!(windows) {
-        var_os("APPDATA").map(PathBuf::from)
-    } else {
-        var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .or_else(|| var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-    }?;
-    Some(base.join("glacia").join("config.toml"))
+/// Write a fully-commented template `config.toml` so the user has a file to
+/// edit on first launch. All entries are commented out — the parser reads
+/// defaults if nothing is uncommented. Returns an error string on failure.
+fn write_default_template(path: &Path) -> Option<String> {
+    if let Some(parent) = path.parent() {
+        if let Err(e) = create_dir_all(parent) {
+            return Some(format!("could not create {}: {e}", parent.display()));
+        }
+    }
+
+    let default_font = platform::default_primary_font();
+    let template = format!(
+        "\
+# Glacia terminal emulator — configuration
+# Generated on first launch. Uncomment and edit any setting you want to change.
+# All commented-out values are the built-in defaults.
+
+[window]
+# width  = 1280
+# height = 800
+
+[font]
+# family      = \"{default_font}\"  # \"auto\" uses the platform default monospace
+# fallback    = \"\"                # CJK / emoji fallback, e.g. \"Noto Sans Mono CJK\"
+# size        = 14.0
+# line_height = 1.25
+
+[terminal]
+# shell             = \"\"  # empty = OS default (cmd.exe on Windows, $SHELL on Unix)
+# working_directory = \"\"  # empty = inherit current directory
+
+[cursor]
+# blink             = true
+# blink_interval_ms = 530
+"
+    );
+
+    if let Err(e) = write_file(path, template) {
+        return Some(format!("could not write {}: {e}", path.display()));
+    }
+    None
 }
