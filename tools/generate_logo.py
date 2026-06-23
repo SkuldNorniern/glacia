@@ -152,24 +152,31 @@ def make_icon(size: int) -> Image.Image:
     return img.resize((size, size), Image.Resampling.LANCZOS)
 
 
-def main() -> None:
+def derive_from_512(icon512: Image.Image) -> None:
+    """Generate all derivative assets from a 512×512 base image."""
     ASSETS.mkdir(exist_ok=True)
 
-    icon = make_icon(1024)
-    icon.save(ASSETS / "glacia-term-icon.png")
-    icon512 = icon.resize((512, 512), Image.Resampling.LANCZOS)
+    icon512 = icon512.convert("RGBA")
     icon512.save(ASSETS / "glacia-term-icon-512.png")
-    icon.resize((256, 256), Image.Resampling.LANCZOS).save(ASSETS / "glacia-term-icon-256.png")
+    icon512.resize((1024, 1024), Image.Resampling.LANCZOS).save(ASSETS / "glacia-term-icon.png")
+    icon512.resize((256, 256), Image.Resampling.LANCZOS).save(ASSETS / "glacia-term-icon-256.png")
 
-    # Windows ICO — multiple sizes so Explorer/taskbar all look crisp.
+    # Windows ICO — PIL derives each size from icon512 via `sizes`.
+    # Do NOT use append_images here; that's for APNG/GIF, not ICO.
     ico_sizes = [(16, 16), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)]
-    ico_frames = [icon512.resize(s, Image.Resampling.LANCZOS) for s in ico_sizes]
-    ico_frames[0].save(
-        ASSETS / "glacia-term-icon.ico",
-        format="ICO",
-        sizes=ico_sizes,
-        append_images=ico_frames[1:],
-    )
+    icon512.save(ASSETS / "glacia-term-icon.ico", format="ICO", sizes=ico_sizes)
+
+
+def main() -> None:
+    base_512 = ASSETS / "glacia-term-icon-512.png"
+    if base_512.exists():
+        # User supplied or previously generated 512 PNG — treat it as the
+        # authoritative source and derive all other assets from it.
+        derive_from_512(Image.open(base_512))
+    else:
+        # No base PNG yet; generate from the procedural drawing code.
+        icon = make_icon(1024)
+        derive_from_512(icon.resize((512, 512), Image.Resampling.LANCZOS))
 
 
 if __name__ == "__main__":
