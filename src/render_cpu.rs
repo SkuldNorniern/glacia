@@ -48,14 +48,78 @@ fn push_cell_text(text: &mut String, cell: &Cell) {
     }
 }
 
+/// Whether a character is in a Unicode range typically absent from Western
+/// monospace fonts (CJK, Hangul, emoji, fullwidth forms, etc.). Used to
+/// route such runs to the configured fallback font.
+fn prefers_fallback(c: char) -> bool {
+    let n = c as u32;
+    matches!(
+        n,
+        0x1100..=0x11FF   // Hangul Jamo
+        | 0x2E80..=0x303F // CJK Radicals, Kangxi, Symbols & Punctuation
+        | 0x3040..=0x9FFF // Kana, Bopomofo, CJK unified block
+        | 0xA000..=0xA4CF // Yi
+        | 0xA960..=0xA97F // Hangul Jamo Extended-A
+        | 0xAC00..=0xD7FF // Hangul Syllables + Jamo Extended-B
+        | 0xF900..=0xFAFF // CJK Compatibility Ideographs
+        | 0xFE30..=0xFE4F // CJK Compatibility Forms
+        | 0xFF00..=0xFFEF // Halfwidth and Fullwidth Forms
+        | 0x1B000..=0x1B0FF // Kana Supplement
+        | 0x1F300..=0x1FAFF // Emoji and pictographs
+    )
+}
+
+/// True if every displayable character in the cell should use the fallback font.
+fn cell_prefers_fallback(cell: &Cell) -> bool {
+    match &cell.kind {
+        CellKind::Char(c) => prefers_fallback(*c),
+        CellKind::Cluster(s) => s.chars().any(prefers_fallback),
+        _ => false,
+    }
+}
+
+struct RowFonts<'a> {
+    primary: &'a Font,
+    bold: Font,
+    fallback: Option<&'a Font>,
+    bold_fallback: Option<Font>,
+}
+
+impl<'a> RowFonts<'a> {
+    fn new(primary: &'a Font, fallback: Option<&'a Font>) -> Self {
+        let bold = Font {
+            weight: FontWeight::Bold,
+            ..primary.clone()
+        };
+        let bold_fallback = fallback.map(|f| Font {
+            weight: FontWeight::Bold,
+            ..f.clone()
+        });
+        Self {
+            primary,
+            bold,
+            fallback,
+            bold_fallback,
+        }
+    }
+
+    fn pick(&self, bold: bool, use_fallback: bool) -> &Font {
+        match (bold, use_fallback) {
+            (true, true) => self.bold_fallback.as_ref().unwrap_or(&self.bold),
+            (true, false) => &self.bold,
+            (false, true) => self.fallback.unwrap_or(self.primary),
+            (false, false) => self.primary,
+        }
+    }
+}
+
 fn draw_row(
     ctx: &mut dyn DrawingContext,
     row: &[Cell],
     y_top: f32,
     baseline: f32,
     metrics: &CellMetrics,
-    font: &Font,
-    bold_font: &Font,
+    fonts: &RowFonts<'_>,
 ) -> AureaResult<()> {
     for (i, cell) in row.iter().enumerate() {
         if let (_, Some(bg)) = resolve_pair(cell) {
@@ -71,11 +135,13 @@ fn draw_row(
     while i < row.len() {
         let (fg, _) = resolve_pair(&row[i]);
         let bold = row[i].attrs.contains(Attrs::BOLD);
+        let use_fallback = cell_prefers_fallback(&row[i]);
         let start = i;
         let mut text = String::new();
         while i < row.len()
             && resolve_pair(&row[i]).0 == fg
             && row[i].attrs.contains(Attrs::BOLD) == bold
+            && cell_prefers_fallback(&row[i]) == use_fallback
         {
             push_cell_text(&mut text, &row[i]);
             i += 1;
@@ -84,7 +150,7 @@ fn draw_row(
             continue;
         }
         let x = start as f32 * metrics.width;
-        let run_font = if bold { bold_font } else { font };
+        let run_font = fonts.pick(bold, use_fallback);
         ctx.draw_text_with_font(&text, Point::new(x, baseline), run_font, &solid(fg))?;
     }
 
@@ -99,27 +165,17 @@ pub fn draw_grid(
     cursor_visible: bool,
     metrics: &CellMetrics,
     font: &Font,
+    fallback_font: Option<&Font>,
 ) -> AureaResult<()> {
     ctx.clear(theme::BACKGROUND)?;
 
-    let bold_font = Font {
-        weight: FontWeight::Bold,
-        ..font.clone()
-    };
+    let fonts = RowFonts::new(font, fallback_font);
     let line_h = metrics.height;
     let baseline_offset = line_h * 0.8;
 
     for (row_idx, row) in rows.iter().enumerate() {
         let y_top = row_idx as f32 * line_h;
-        draw_row(
-            ctx,
-            row,
-            y_top,
-            y_top + baseline_offset,
-            metrics,
-            font,
-            &bold_font,
-        )?;
+        draw_row(ctx, row, y_top, y_top + baseline_offset, metrics, &fonts)?;
     }
 
     if cursor_visible {
