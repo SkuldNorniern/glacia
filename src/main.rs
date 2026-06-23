@@ -2,6 +2,7 @@ mod canvas;
 mod config;
 mod input;
 mod platform;
+mod plugin;
 mod render_cpu;
 mod terminal;
 mod theme;
@@ -116,6 +117,11 @@ fn wait_for_close_with_message(
 fn main() -> AureaResult<()> {
     let (config, config_diagnostic) = Config::load();
     let diagnostics: Vec<String> = config_diagnostic.into_iter().collect();
+
+    let plugins = platform::plugins_dir()
+        .map(|d| plugin::load_plugins(&d))
+        .unwrap_or_default();
+    let _ = plugins; // available for the oxygen scripting engine when wired in
 
     let mut window = Window::new(
         DEFAULT_TITLE,
