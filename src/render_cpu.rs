@@ -296,7 +296,18 @@ fn draw_row(
     x_offset: f32,
     sel_cols: Option<(usize, usize)>,
 ) -> AureaResult<()> {
-    // Pass 1: cell backgrounds
+    // Pass 1: row background + per-cell overrides.
+    // Paint one rect covering the full row first so we never rely on a global
+    // ctx.clear() — that "blank → draw" cycle is the primary cause of flicker.
+    ctx.draw_rect(
+        Rect::new(
+            x_offset,
+            y_top,
+            row.len() as f32 * metrics.width,
+            metrics.height,
+        ),
+        &solid(theme::BACKGROUND),
+    )?;
     for (i, cell) in row.iter().enumerate() {
         if let (_, Some(bg)) = resolve_pair(cell) {
             let x = i as f32 * metrics.width + x_offset;
@@ -387,8 +398,6 @@ pub fn draw_grid(
     padding: f32,
     selection: Option<SelectionRange>,
 ) -> AureaResult<()> {
-    ctx.clear(theme::BACKGROUND)?;
-
     let line_h = metrics.height;
 
     for (row_idx, row) in rows.iter().enumerate() {
