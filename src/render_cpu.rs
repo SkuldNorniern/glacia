@@ -134,3 +134,44 @@ pub fn draw_grid(
 
     Ok(())
 }
+
+/// Draw a one-line diagnostics banner pinned to the bottom of the window —
+/// used for non-fatal startup notices (bad config, etc.).
+pub fn draw_diagnostics_banner(
+    ctx: &mut dyn DrawingContext,
+    message: &str,
+    width: f32,
+    height: f32,
+    font: &Font,
+) -> AureaResult<()> {
+    let banner_height = 24.0;
+    let y = height - banner_height;
+    ctx.draw_rect(
+        Rect::new(0.0, y, width, banner_height),
+        &solid(Color::rgb(60, 40, 20)),
+    )?;
+    ctx.draw_text_with_font(
+        message,
+        Point::new(8.0, y + banner_height * 0.7),
+        font,
+        &solid(Color::rgb(247, 207, 109)),
+    )?;
+    Ok(())
+}
+
+/// Full-window message for fatal startup failures (e.g. the shell couldn't
+/// spawn) — there's no terminal grid to draw alongside it.
+pub fn draw_fatal_message(
+    ctx: &mut dyn DrawingContext,
+    message: &str,
+    font: &Font,
+) -> AureaResult<()> {
+    ctx.clear(theme::BACKGROUND)?;
+    ctx.draw_text_with_font(
+        message,
+        Point::new(16.0, 32.0),
+        font,
+        &solid(Color::rgb(255, 107, 107)),
+    )?;
+    Ok(())
+}
