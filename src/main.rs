@@ -23,6 +23,7 @@ use terminal::{SpawnOverrides, TerminalSession};
 use vanta::{Cell, CellKind};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(8);
+const FRAME_INTERVAL: Duration = Duration::from_micros(16_667); // 60 FPS render cap
 const DEFAULT_TITLE: &str = "Glacia";
 
 /// Measure font metrics and build the cell sizing struct.
@@ -220,6 +221,7 @@ fn main() -> AureaResult<()> {
 
     let mut cursor_visible = true;
     let mut last_blink = Instant::now();
+    let mut last_render = Instant::now();
     // Track when output last arrived; blink timer is suppressed until the PTY
     // has been idle for at least one full blink interval (avoids cursor
     // flickering during heavy output like `cat large-file`).
@@ -457,7 +459,7 @@ fn main() -> AureaResult<()> {
             break;
         }
 
-        if needs_redraw {
+        if needs_redraw && last_render.elapsed() >= FRAME_INTERVAL {
             let pad = padding as f32;
             let visible_rows = ((window_size.1.saturating_sub(2 * padding)) as f32 / metrics.height)
                 .max(1.0) as usize;
@@ -521,6 +523,7 @@ fn main() -> AureaResult<()> {
                 Ok(())
             })?;
             needs_redraw = false;
+            last_render = Instant::now();
         }
 
         window.process_frames()?;
