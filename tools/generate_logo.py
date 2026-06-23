@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from pathlib import Path
 
@@ -153,18 +153,21 @@ def make_icon(size: int) -> Image.Image:
 
 
 def derive_from_512(icon512: Image.Image) -> None:
-    """Generate all derivative assets from a 512×512 base image."""
+    """Generate all derivative assets from a 512×512 base image.
+
+    glacia-term-icon-512.png is the authoritative source; this function
+    never writes back to it.
+    """
     ASSETS.mkdir(exist_ok=True)
 
-    icon512 = icon512.convert("RGBA")
-    icon512.save(ASSETS / "glacia-term-icon-512.png")
-    icon512.resize((1024, 1024), Image.Resampling.LANCZOS).save(ASSETS / "glacia-term-icon.png")
-    icon512.resize((256, 256), Image.Resampling.LANCZOS).save(ASSETS / "glacia-term-icon-256.png")
+    src = icon512.convert("RGBA")
+    src.resize((1024, 1024), Image.Resampling.LANCZOS).save(ASSETS / "glacia-term-icon.png")
+    src.resize((256, 256), Image.Resampling.LANCZOS).save(ASSETS / "glacia-term-icon-256.png")
 
-    # Windows ICO — PIL derives each size from icon512 via `sizes`.
+    # Windows ICO — PIL derives each size from src via `sizes`.
     # Do NOT use append_images here; that's for APNG/GIF, not ICO.
     ico_sizes = [(16, 16), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)]
-    icon512.save(ASSETS / "glacia-term-icon.ico", format="ICO", sizes=ico_sizes)
+    src.save(ASSETS / "glacia-term-icon.ico", format="ICO", sizes=ico_sizes)
 
 
 def main() -> None:
