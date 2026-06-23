@@ -24,3 +24,6 @@ target
 # Added by cargo
 
 /target
+
+# Local tooling scripts — run locally, never committed
+/tools/
