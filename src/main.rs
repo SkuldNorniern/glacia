@@ -21,9 +21,22 @@ use terminal::{SpawnOverrides, TerminalSession};
 const POLL_INTERVAL: Duration = Duration::from_millis(8);
 const DEFAULT_TITLE: &str = "Glacia";
 
-fn cell_metrics(config: &Config) -> CellMetrics {
+/// Measure the font's actual horizontal advance for a representative glyph
+/// rather than guessing `font_size * 0.6` — the guess drifts visibly from
+/// the real rendered text over enough columns (the cursor block creeps away
+/// from the character it should sit on). Falls back to the guess if
+/// measurement fails or returns something degenerate.
+fn cell_metrics(config: &Config, canvas: &Arc<Mutex<SendableCanvas>>, font: &Font) -> CellMetrics {
+    let mut width = config.font.size * 0.6;
+    let _ = lock(canvas.as_ref()).draw(|ctx| {
+        let measured = ctx.measure_text("M", font)?;
+        if measured.advance > 0.0 {
+            width = measured.advance;
+        }
+        Ok(())
+    });
     CellMetrics {
-        width: config.font.size * 0.6,
+        width,
         height: config.font.size * config.font.line_height,
     }
 }
@@ -48,22 +61,19 @@ fn display_shell_name(raw: &str) -> &str {
     &base[..base.len() - 4]
 }
 
-/// A window that shows a fatal startup message and waits to be closed —
-/// used when there's no terminal session to render alongside (e.g. the
-/// shell failed to spawn).
-fn run_fatal_message(message: &str) -> AureaResult<()> {
-    let mut window = Window::new(DEFAULT_TITLE, 720, 240)?;
-    let raw_canvas = Canvas::new(720, 240, RendererBackend::Cpu)?;
-    raw_canvas.set_draw_callback(|ctx| ctx.clear(theme::BACKGROUND))?;
-    let canvas_arc = Arc::new(Mutex::new(SendableCanvas(raw_canvas)));
-    window.set_content(SharedCanvas(canvas_arc.clone()))?;
-
-    let font = Font::new("Consolas", 14.0);
+/// Wait for the window to be closed, redrawing `message` as a fatal
+/// startup notice — used when there's no terminal session to render
+/// alongside (e.g. the shell failed to spawn).
+fn wait_for_close_with_message(
+    window: &Window,
+    canvas_arc: &Arc<Mutex<SendableCanvas>>,
+    font: &Font,
+    message: &str,
+) -> AureaResult<()> {
     {
         let mut canvas = lock(canvas_arc.as_ref());
-        canvas.draw(|ctx| render_cpu::draw_fatal_message(ctx, message, &font))?;
+        canvas.draw(|ctx| render_cpu::draw_fatal_message(ctx, message, font))?;
     }
-
     loop {
         unsafe { ng_platform_poll_events() };
         let events = window.poll_events();
@@ -82,20 +92,6 @@ fn run_fatal_message(message: &str) -> AureaResult<()> {
 fn main() -> AureaResult<()> {
     let (config, config_diagnostic) = Config::load();
     let diagnostics: Vec<String> = config_diagnostic.into_iter().collect();
-
-    let metrics = cell_metrics(&config);
-    let (cols, rows) = grid_size(config.window.width, config.window.height, &metrics);
-    let mut term = match TerminalSession::spawn(SpawnOverrides {
-        cols,
-        rows,
-        shell: &config.terminal.shell,
-        working_directory: &config.terminal.working_directory,
-    }) {
-        Ok(term) => term,
-        Err(err) => {
-            return run_fatal_message(&format!("failed to spawn default shell: {err}"));
-        }
-    };
 
     let mut window = Window::new(
         DEFAULT_TITLE,
@@ -117,6 +113,21 @@ fn main() -> AureaResult<()> {
     window.set_content(SharedCanvas(canvas_arc.clone()))?;
 
     let font = Font::new(&config.font.family, config.font.size);
+    let metrics = cell_metrics(&config, &canvas_arc, &font);
+    let (cols, rows) = grid_size(config.window.width, config.window.height, &metrics);
+    let mut term = match TerminalSession::spawn(SpawnOverrides {
+        cols,
+        rows,
+        shell: &config.terminal.shell,
+        working_directory: &config.terminal.working_directory,
+    }) {
+        Ok(term) => term,
+        Err(err) => {
+            let message = format!("failed to spawn default shell: {err}");
+            return wait_for_close_with_message(&window, &canvas_arc, &font, &message);
+        }
+    };
+
     let mut cursor_visible = true;
     let mut last_blink = Instant::now();
     let mut needs_redraw = true;
