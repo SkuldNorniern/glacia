@@ -15,11 +15,23 @@ pub struct TerminalSession {
     cursor: (usize, usize),
 }
 
+/// Overrides for the spawned shell. Empty `shell`/`working_directory` mean
+/// "use the platform default" / "inherit the current directory".
+pub struct SpawnOverrides<'a> {
+    pub cols: u16,
+    pub rows: u16,
+    pub shell: &'a str,
+    pub working_directory: &'a str,
+}
+
 impl TerminalSession {
-    pub fn spawn(cols: u16, rows: u16) -> io::Result<Self> {
+    pub fn spawn(overrides: SpawnOverrides<'_>) -> io::Result<Self> {
         let config = SpawnConfig {
-            cols,
-            rows,
+            cols: overrides.cols,
+            rows: overrides.rows,
+            program: (!overrides.shell.is_empty()).then(|| overrides.shell.to_owned()),
+            cwd: (!overrides.working_directory.is_empty())
+                .then(|| overrides.working_directory.into()),
             ..SpawnConfig::default()
         };
         let term = Terminal::spawn_with_config(&config)?;
@@ -65,5 +77,10 @@ impl TerminalSession {
 
     pub fn is_running(&self) -> bool {
         self.term.is_running()
+    }
+
+    /// The shell/app's OSC 0/2 title, if it has set one.
+    pub fn title(&self) -> Option<String> {
+        self.term.title()
     }
 }

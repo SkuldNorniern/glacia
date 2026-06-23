@@ -14,3 +14,4 @@ expect_used = "warn"
 [dependencies]
 aurea = { git = "https://github.com/SkuldNorniern/aurea" }
 vanta = { git = "https://github.com/SkuldNorniern/vanta" }
+toml = "0.9"
