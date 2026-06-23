@@ -1,4 +1,5 @@
 mod canvas;
+mod config;
 mod input;
 mod render_cpu;
 mod terminal;
@@ -13,21 +14,17 @@ use aurea::render::{Canvas, Font, RendererBackend};
 use aurea::{AureaResult, Window, WindowEvent};
 
 use canvas::{SendableCanvas, SharedCanvas, lock};
+use config::Config;
 use render_cpu::CellMetrics;
-use terminal::TerminalSession;
+use terminal::{SpawnOverrides, TerminalSession};
 
-const WINDOW_WIDTH: u32 = 1280;
-const WINDOW_HEIGHT: u32 = 800;
 const POLL_INTERVAL: Duration = Duration::from_millis(8);
-const FONT_SIZE: f32 = 14.0;
-const LINE_HEIGHT: f32 = 1.25;
-const FONT_FAMILY: &str = "Consolas";
-const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(530);
+const DEFAULT_TITLE: &str = "Glacia";
 
-fn cell_metrics() -> CellMetrics {
+fn cell_metrics(config: &Config) -> CellMetrics {
     CellMetrics {
-        width: FONT_SIZE * 0.6,
-        height: FONT_SIZE * LINE_HEIGHT,
+        width: config.font.size * 0.6,
+        height: config.font.size * config.font.line_height,
     }
 }
 
@@ -37,15 +34,80 @@ fn grid_size(width: u32, height: u32, metrics: &CellMetrics) -> (u16, u16) {
     (cols, rows)
 }
 
+/// `cmd.exe`'s default, un-customized console title is its own full exe
+/// path (e.g. `C:\WINDOWS\system32\cmd.exe`) — collapse that to a bare file
+/// name. Anything else (an explicit `title` call, WSL/zsh's `user@host: path`
+/// prompts) doesn't match this shape and passes through unchanged, since
+/// it's already meaningful.
+fn display_shell_name(raw: &str) -> &str {
+    let lower = raw.to_ascii_lowercase();
+    if !raw.contains('\\') || !lower.ends_with(".exe") {
+        return raw;
+    }
+    let base = raw.rsplit('\\').next().unwrap_or(raw);
+    &base[..base.len() - 4]
+}
+
+/// A window that shows a fatal startup message and waits to be closed —
+/// used when there's no terminal session to render alongside (e.g. the
+/// shell failed to spawn).
+fn run_fatal_message(message: &str) -> AureaResult<()> {
+    let mut window = Window::new(DEFAULT_TITLE, 720, 240)?;
+    let raw_canvas = Canvas::new(720, 240, RendererBackend::Cpu)?;
+    raw_canvas.set_draw_callback(|ctx| ctx.clear(theme::BACKGROUND))?;
+    let canvas_arc = Arc::new(Mutex::new(SendableCanvas(raw_canvas)));
+    window.set_content(SharedCanvas(canvas_arc.clone()))?;
+
+    let font = Font::new("Consolas", 14.0);
+    {
+        let mut canvas = lock(canvas_arc.as_ref());
+        canvas.draw(|ctx| render_cpu::draw_fatal_message(ctx, message, &font))?;
+    }
+
+    loop {
+        unsafe { ng_platform_poll_events() };
+        let events = window.poll_events();
+        if events
+            .iter()
+            .any(|event| matches!(event, WindowEvent::CloseRequested))
+        {
+            break;
+        }
+        window.process_frames()?;
+        sleep(POLL_INTERVAL);
+    }
+    Ok(())
+}
+
 fn main() -> AureaResult<()> {
-    let mut window = Window::new("Glacia", WINDOW_WIDTH as i32, WINDOW_HEIGHT as i32)?;
+    let (config, config_diagnostic) = Config::load();
+    let diagnostics: Vec<String> = config_diagnostic.into_iter().collect();
 
-    let metrics = cell_metrics();
-    let (cols, rows) = grid_size(WINDOW_WIDTH, WINDOW_HEIGHT, &metrics);
-    let mut term = TerminalSession::spawn(cols, rows)
-        .unwrap_or_else(|err| panic!("failed to spawn default shell: {err}"));
+    let metrics = cell_metrics(&config);
+    let (cols, rows) = grid_size(config.window.width, config.window.height, &metrics);
+    let mut term = match TerminalSession::spawn(SpawnOverrides {
+        cols,
+        rows,
+        shell: &config.terminal.shell,
+        working_directory: &config.terminal.working_directory,
+    }) {
+        Ok(term) => term,
+        Err(err) => {
+            return run_fatal_message(&format!("failed to spawn default shell: {err}"));
+        }
+    };
 
-    let raw_canvas = Canvas::new(WINDOW_WIDTH, WINDOW_HEIGHT, RendererBackend::Cpu)?;
+    let mut window = Window::new(
+        DEFAULT_TITLE,
+        config.window.width as i32,
+        config.window.height as i32,
+    )?;
+
+    let raw_canvas = Canvas::new(
+        config.window.width,
+        config.window.height,
+        RendererBackend::Cpu,
+    )?;
     // A registered draw callback is required even though the loop below
     // redraws manually via `canvas.draw()`: without one, OS-initiated
     // repaints (e.g. the window's first paint) have nothing to call back
@@ -54,10 +116,12 @@ fn main() -> AureaResult<()> {
     let canvas_arc = Arc::new(Mutex::new(SendableCanvas(raw_canvas)));
     window.set_content(SharedCanvas(canvas_arc.clone()))?;
 
-    let font = Font::new(FONT_FAMILY, FONT_SIZE);
+    let font = Font::new(&config.font.family, config.font.size);
     let mut cursor_visible = true;
     let mut last_blink = Instant::now();
     let mut needs_redraw = true;
+    let mut window_size = (config.window.width, config.window.height);
+    let mut last_title: Option<String> = None;
 
     loop {
         unsafe { ng_platform_poll_events() };
@@ -68,6 +132,7 @@ fn main() -> AureaResult<()> {
             match event {
                 WindowEvent::CloseRequested => should_close = true,
                 WindowEvent::Resized { width, height } => {
+                    window_size = (*width, *height);
                     let (cols, rows) = grid_size(*width, *height, &metrics);
                     let _ = term.resize(cols, rows);
                     needs_redraw = true;
@@ -104,7 +169,19 @@ fn main() -> AureaResult<()> {
             cursor_visible = true;
             last_blink = Instant::now();
             needs_redraw = true;
-        } else if last_blink.elapsed() >= CURSOR_BLINK_INTERVAL {
+
+            let title = term.title();
+            if title != last_title {
+                let shown = match &title {
+                    Some(title) => format!("{DEFAULT_TITLE} - {}", display_shell_name(title)),
+                    None => DEFAULT_TITLE.to_owned(),
+                };
+                let _ = window.set_title(&shown);
+                last_title = title;
+            }
+        } else if config.cursor.blink
+            && last_blink.elapsed() >= Duration::from_millis(config.cursor.blink_interval_ms)
+        {
             cursor_visible = !cursor_visible;
             last_blink = Instant::now();
             needs_redraw = true;
@@ -128,7 +205,17 @@ fn main() -> AureaResult<()> {
                     cursor_visible,
                     &metrics,
                     &font,
-                )
+                )?;
+                if let Some(message) = diagnostics.first() {
+                    render_cpu::draw_diagnostics_banner(
+                        ctx,
+                        message,
+                        window_size.0 as f32,
+                        window_size.1 as f32,
+                        &font,
+                    )?;
+                }
+                Ok(())
             })?;
             needs_redraw = false;
         }
