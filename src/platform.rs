@@ -29,6 +29,35 @@ pub fn plugins_dir() -> Option<PathBuf> {
     Some(base.join("glacia").join("plugins"))
 }
 
+/// Find the preferred interactive shell, trying modern shells before the OS
+/// default. On Windows this avoids landing in cmd.exe when PowerShell is
+/// available. On Unix `None` is returned so Vanta uses `$SHELL` / `/bin/sh`.
+pub fn preferred_shell() -> Option<String> {
+    #[cfg(windows)]
+    {
+        for name in &["pwsh", "powershell"] {
+            if which_exe(name) {
+                return Some(name.to_string());
+            }
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn which_exe(name: &str) -> bool {
+    use std::env;
+    let Ok(path_var) = env::var("PATH") else {
+        return false;
+    };
+    for dir in env::split_paths(&path_var) {
+        if dir.join(format!("{name}.exe")).exists() {
+            return true;
+        }
+    }
+    false
+}
+
 /// Safe built-in primary monospace font for this platform.
 ///
 /// Each choice ships with the OS and requires no extra installs. Users can
