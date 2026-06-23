@@ -4,11 +4,14 @@
 use std::collections::HashSet;
 
 use aurea::AureaResult;
-use aurea::render::{Color, DrawingContext, Font, FontWeight, Paint, PaintStyle, Point, Rect};
+use aurea::render::{
+    Color, DrawingContext, Font, FontStyle, FontWeight, Paint, PaintStyle, Point, Rect,
+};
 use vanta::Color as TermColor;
 use vanta::vt::Attrs;
 use vanta::{Cell, CellKind};
 
+use crate::config::CursorShape;
 use crate::theme;
 
 pub struct CellMetrics {
@@ -17,10 +20,12 @@ pub struct CellMetrics {
     /// Distance from the top of a cell row to the text baseline, derived from
     /// the actual font ascent rather than a fixed fraction of `height`.
     pub baseline_offset: f32,
+    /// Raw font ascent (pixels), used to position underline and strikethrough.
+    pub ascent: f32,
 }
 
-/// Font set for one rendered frame: primary, bold, and their fallback
-/// counterparts for CJK/emoji runs.
+/// Font set for one rendered frame: primary, bold, italic, bold-italic, and
+/// their fallback counterparts for CJK/emoji runs.
 ///
 /// Built once from the loaded `Font` objects and reused every frame — avoids
 /// cloning font family strings on the hot path. Call [`RowFonts::probe`] inside
@@ -29,8 +34,12 @@ pub struct CellMetrics {
 pub struct RowFonts {
     pub primary: Font,
     bold: Font,
+    italic: Font,
+    bold_italic: Font,
     pub fallback: Option<Font>,
     bold_fallback: Option<Font>,
+    italic_fallback: Option<Font>,
+    bold_italic_fallback: Option<Font>,
     /// Codepoints detected at startup as missing from the primary font.
     /// Populated by [`RowFonts::probe`]; only used when a fallback is configured.
     probed_fallback: HashSet<u32>,
@@ -42,15 +51,37 @@ impl RowFonts {
             weight: FontWeight::Bold,
             ..primary.clone()
         };
+        let italic = Font {
+            style: FontStyle::Italic,
+            ..primary.clone()
+        };
+        let bold_italic = Font {
+            weight: FontWeight::Bold,
+            style: FontStyle::Italic,
+            ..primary.clone()
+        };
         let bold_fallback = fallback.as_ref().map(|f| Font {
             weight: FontWeight::Bold,
+            ..f.clone()
+        });
+        let italic_fallback = fallback.as_ref().map(|f| Font {
+            style: FontStyle::Italic,
+            ..f.clone()
+        });
+        let bold_italic_fallback = fallback.as_ref().map(|f| Font {
+            weight: FontWeight::Bold,
+            style: FontStyle::Italic,
             ..f.clone()
         });
         Self {
             primary,
             bold,
+            italic,
+            bold_italic,
             fallback,
             bold_fallback,
+            italic_fallback,
+            bold_italic_fallback,
             probed_fallback: HashSet::new(),
         }
     }
@@ -107,12 +138,19 @@ impl RowFonts {
         }
     }
 
-    fn pick(&self, bold: bool, use_fallback: bool) -> &Font {
-        match (bold, use_fallback) {
-            (true, true) => self.bold_fallback.as_ref().unwrap_or(&self.bold),
-            (true, false) => &self.bold,
-            (false, true) => self.fallback.as_ref().unwrap_or(&self.primary),
-            (false, false) => &self.primary,
+    fn pick(&self, bold: bool, italic: bool, use_fallback: bool) -> &Font {
+        match (bold, italic, use_fallback) {
+            (true, true, true) => self
+                .bold_italic_fallback
+                .as_ref()
+                .unwrap_or(&self.bold_italic),
+            (true, true, false) => &self.bold_italic,
+            (false, true, true) => self.italic_fallback.as_ref().unwrap_or(&self.italic),
+            (false, true, false) => &self.italic,
+            (true, false, true) => self.bold_fallback.as_ref().unwrap_or(&self.bold),
+            (true, false, false) => &self.bold,
+            (false, false, true) => self.fallback.as_ref().unwrap_or(&self.primary),
+            (false, false, false) => &self.primary,
         }
     }
 
@@ -155,24 +193,44 @@ fn solid(color: Color) -> Paint {
     }
 }
 
-/// Resolve a cell's effective (fg, bg) pair, honoring reverse video.
-fn resolve_pair(cell: &Cell) -> (Color, Option<Color>) {
-    if cell.attrs.contains(Attrs::INVERSE) {
-        return (
-            theme::resolve(cell.bg, theme::BACKGROUND),
-            Some(theme::resolve(cell.fg, theme::FOREGROUND)),
-        );
-    }
-    let bg = match cell.bg {
-        TermColor::Default => None,
-        other => Some(theme::resolve(other, theme::BACKGROUND)),
-    };
-    (theme::resolve(cell.fg, theme::FOREGROUND), bg)
+/// Scale an RGB color towards black — used to render the DIM attribute.
+fn dim_color(c: Color) -> Color {
+    Color::rgb(
+        (c.r as f32 * 0.55) as u8,
+        (c.g as f32 * 0.55) as u8,
+        (c.b as f32 * 0.55) as u8,
+    )
 }
 
-/// Append a cell's display text. Continuation cells (the right half of a
-/// width-2 glyph) contribute nothing — they're never drawn directly.
+/// Resolve a cell's effective (fg, bg) pair, honoring reverse video.
+/// For DIM cells the foreground is further dimmed towards black.
+fn resolve_pair(cell: &Cell) -> (Color, Option<Color>) {
+    let (mut fg, bg) = if cell.attrs.contains(Attrs::INVERSE) {
+        (
+            theme::resolve(cell.bg, theme::BACKGROUND),
+            Some(theme::resolve(cell.fg, theme::FOREGROUND)),
+        )
+    } else {
+        let bg = match cell.bg {
+            TermColor::Default => None,
+            other => Some(theme::resolve(other, theme::BACKGROUND)),
+        };
+        (theme::resolve(cell.fg, theme::FOREGROUND), bg)
+    };
+    if cell.attrs.contains(Attrs::DIM) {
+        fg = dim_color(fg);
+    }
+    (fg, bg)
+}
+
+/// Append a cell's display text into `text`.
+/// HIDDEN cells render as a space so they occupy space but reveal nothing.
+/// Continuation cells (right half of width-2 glyphs) contribute nothing.
 fn push_cell_text(text: &mut String, cell: &Cell) {
+    if cell.attrs.contains(Attrs::HIDDEN) {
+        text.push(' ');
+        return;
+    }
     match &cell.kind {
         CellKind::Char(c) => text.push(*c),
         CellKind::Cluster(s) => text.push_str(s),
@@ -199,6 +257,7 @@ fn draw_row(
     metrics: &CellMetrics,
     fonts: &RowFonts,
 ) -> AureaResult<()> {
+    // Pass 1: cell backgrounds
     for (i, cell) in row.iter().enumerate() {
         if let (_, Some(bg)) = resolve_pair(cell) {
             let x = i as f32 * metrics.width;
@@ -209,16 +268,19 @@ fn draw_row(
         }
     }
 
+    // Pass 2: text runs — batched by (fg, bold, italic, fallback) for fewer draw calls
     let mut i = 0usize;
     while i < row.len() {
         let (fg, _) = resolve_pair(&row[i]);
         let bold = row[i].attrs.contains(Attrs::BOLD);
+        let italic = row[i].attrs.contains(Attrs::ITALIC);
         let use_fallback = cell_needs_fallback(&row[i], fonts);
         let start = i;
         let mut text = String::new();
         while i < row.len()
             && resolve_pair(&row[i]).0 == fg
             && row[i].attrs.contains(Attrs::BOLD) == bold
+            && row[i].attrs.contains(Attrs::ITALIC) == italic
             && cell_needs_fallback(&row[i], fonts) == use_fallback
         {
             push_cell_text(&mut text, &row[i]);
@@ -231,9 +293,28 @@ fn draw_row(
         ctx.draw_text_with_font(
             &text,
             Point::new(x, baseline),
-            fonts.pick(bold, use_fallback),
+            fonts.pick(bold, italic, use_fallback),
             &solid(fg),
         )?;
+    }
+
+    // Pass 3: underlines and strikethroughs — drawn as thin rects after text so
+    // they sit on top of any background fills and below the text layer.
+    let ul_y = baseline + 2.0; // just below the text baseline
+    let st_y = baseline - metrics.ascent * 0.35; // roughly middle of cap height
+    for (i, cell) in row.iter().enumerate() {
+        let x = i as f32 * metrics.width;
+        if cell.attrs.contains(Attrs::UNDERLINE) {
+            let ul_color = match cell.underline_color {
+                TermColor::Default => resolve_pair(cell).0,
+                other => theme::resolve(other, theme::FOREGROUND),
+            };
+            ctx.draw_rect(Rect::new(x, ul_y, metrics.width, 1.5), &solid(ul_color))?;
+        }
+        if cell.attrs.contains(Attrs::STRIKE) {
+            let (fg, _) = resolve_pair(cell);
+            ctx.draw_rect(Rect::new(x, st_y, metrics.width, 1.0), &solid(fg))?;
+        }
     }
 
     Ok(())
@@ -247,6 +328,7 @@ pub fn draw_grid(
     cursor_visible: bool,
     metrics: &CellMetrics,
     fonts: &RowFonts,
+    cursor_shape: &CursorShape,
 ) -> AureaResult<()> {
     ctx.clear(theme::BACKGROUND)?;
 
@@ -266,12 +348,47 @@ pub fn draw_grid(
 
     if cursor_visible {
         let (row, col) = cursor;
-        let x = col as f32 * metrics.width;
-        let y = row as f32 * line_h;
-        ctx.draw_rect(
-            Rect::new(x, y, metrics.width, line_h),
-            &solid(theme::CURSOR),
-        )?;
+        if row < rows.len() {
+            let x = col as f32 * metrics.width;
+            let y = row as f32 * line_h;
+            match cursor_shape {
+                CursorShape::Block => {
+                    ctx.draw_rect(
+                        Rect::new(x, y, metrics.width, line_h),
+                        &solid(theme::CURSOR),
+                    )?;
+                    // Redraw the character on top of the block with inverted colours.
+                    if col < rows[row].len() {
+                        let cell = &rows[row][col];
+                        let mut text = String::new();
+                        push_cell_text(&mut text, cell);
+                        if !text.trim().is_empty() {
+                            let bold = cell.attrs.contains(Attrs::BOLD);
+                            let italic = cell.attrs.contains(Attrs::ITALIC);
+                            let use_fallback = cell_needs_fallback(cell, fonts);
+                            let char_color = theme::resolve(cell.bg, theme::BACKGROUND);
+                            ctx.draw_text_with_font(
+                                &text,
+                                Point::new(x, y + metrics.baseline_offset),
+                                fonts.pick(bold, italic, use_fallback),
+                                &solid(char_color),
+                            )?;
+                        }
+                    }
+                }
+                CursorShape::Beam => {
+                    // 2 px wide vertical bar at the left edge
+                    ctx.draw_rect(Rect::new(x, y, 2.0, line_h), &solid(theme::CURSOR))?;
+                }
+                CursorShape::Underline => {
+                    // 2 px high horizontal bar at the bottom of the cell
+                    ctx.draw_rect(
+                        Rect::new(x, y + line_h - 2.0, metrics.width, 2.0),
+                        &solid(theme::CURSOR),
+                    )?;
+                }
+            }
+        }
     }
 
     Ok(())

@@ -41,18 +41,20 @@ fn cell_metrics(
     let mut width = config.font.size * 0.6;
     let mut height = configured_h;
     let mut baseline_offset = configured_h * 0.8;
+    let mut ascent = configured_h * 0.8;
 
     let _ = lock(canvas.as_ref()).draw(|ctx| {
         if let Ok(m) = ctx.measure_text("M", &row_fonts.primary) {
-            if m.advance > 0.0 {
-                width = m.advance;
-            }
             if m.ascent > 0.0 {
                 let font_h = m.ascent + m.descent;
                 let leading = font_h * (config.font.line_height - 1.0);
                 // Centre the line_height gap evenly above and below the glyph.
                 baseline_offset = leading / 2.0 + m.ascent;
                 height = font_h + leading;
+                ascent = m.ascent;
+            }
+            if m.advance > 0.0 {
+                width = m.advance;
             }
         }
         row_fonts.probe(ctx, width);
@@ -63,6 +65,7 @@ fn cell_metrics(
         width,
         height,
         baseline_offset,
+        ascent,
     }
 }
 
@@ -171,6 +174,10 @@ fn main() -> AureaResult<()> {
 
     let mut cursor_visible = true;
     let mut last_blink = Instant::now();
+    // Track when output last arrived; blink timer is suppressed until the PTY
+    // has been idle for at least one full blink interval (avoids cursor
+    // flickering during heavy output like `cat large-file`).
+    let mut last_output = Instant::now();
     let mut needs_redraw = true;
     let mut window_size = (config.window.width, config.window.height);
     let mut last_title: Option<String> = None;
@@ -226,7 +233,7 @@ fn main() -> AureaResult<()> {
                             last_blink = Instant::now();
                             needs_redraw = true;
                         } else if let Some(bytes) = input::terminal_key_bytes(*key, *modifiers) {
-                            let _ = term.write_str(bytes);
+                            let _ = term.write_str(&bytes);
                             cursor_visible = true;
                             last_blink = Instant::now();
                             needs_redraw = true;
@@ -259,7 +266,7 @@ fn main() -> AureaResult<()> {
                             _ => {
                                 if let Some(bytes) = input::terminal_key_bytes(*key, *modifiers) {
                                     scroll_offset = 0;
-                                    let _ = term.write_str(bytes);
+                                    let _ = term.write_str(&bytes);
                                     cursor_visible = true;
                                     last_blink = Instant::now();
                                     needs_redraw = true;
@@ -318,6 +325,7 @@ fn main() -> AureaResult<()> {
         if term.sync() {
             cursor_visible = true;
             last_blink = Instant::now();
+            last_output = Instant::now();
             needs_redraw = true;
             // Entering alt screen (TUI app launched): clear any existing
             // scrollback offset so the full alt-screen is immediately visible.
@@ -335,6 +343,7 @@ fn main() -> AureaResult<()> {
                 last_title = title;
             }
         } else if config.cursor.blink
+            && last_output.elapsed() >= Duration::from_millis(config.cursor.blink_interval_ms)
             && last_blink.elapsed() >= Duration::from_millis(config.cursor.blink_interval_ms)
         {
             cursor_visible = !cursor_visible;
@@ -368,6 +377,7 @@ fn main() -> AureaResult<()> {
                         cursor_visible,
                         &metrics,
                         &row_fonts,
+                        &config.cursor.shape,
                     )?;
                 } else {
                     let sb = term.scrollback_rows();
@@ -391,6 +401,7 @@ fn main() -> AureaResult<()> {
                         false,
                         &metrics,
                         &row_fonts,
+                        &config.cursor.shape,
                     )?;
                 }
                 if let Some(message) = diagnostics.first() {
