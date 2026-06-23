@@ -488,7 +488,7 @@ checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 [[package]]
 name = "vanta"
 version = "0.1.0"
-source = "git+https://github.com/SkuldNorniern/vanta#d98d3271f6a4804dfdddbfd2981ab4c1a0128afa"
+source = "git+https://github.com/SkuldNorniern/vanta#57bdd82d352a19c300a9511276a141aa3a57e023"
 
 [[package]]
 name = "version_check"

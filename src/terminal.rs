@@ -14,6 +14,7 @@ pub struct TerminalSession {
     scrollback: Vec<Vec<Cell>>,
     cells: Vec<Vec<Cell>>,
     cursor: (usize, usize),
+    cursor_visible: bool,
 }
 
 /// Overrides for the spawned shell. Empty `shell`/`working_directory` mean
@@ -42,6 +43,7 @@ impl TerminalSession {
             scrollback: Vec::new(),
             cells: Vec::new(),
             cursor: (0, 0),
+            cursor_visible: true,
         })
     }
 
@@ -59,6 +61,7 @@ impl TerminalSession {
         self.cursor = (line.saturating_sub(snapshot.scrollback.len()), col);
         self.scrollback = snapshot.scrollback;
         self.cells = snapshot.screen;
+        self.cursor_visible = snapshot.cursor_visible;
         true
     }
 
@@ -72,6 +75,12 @@ impl TerminalSession {
 
     pub fn cursor(&self) -> (usize, usize) {
         self.cursor
+    }
+
+    /// Whether the app has requested the cursor be shown (DECTCEM).
+    /// TUI apps like vim hide it to avoid a second cursor block.
+    pub fn app_cursor_visible(&self) -> bool {
+        self.cursor_visible
     }
 
     pub fn write_str(&self, s: &str) -> io::Result<()> {
