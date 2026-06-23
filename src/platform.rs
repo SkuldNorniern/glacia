@@ -15,6 +15,20 @@ pub fn user_config_path() -> Option<PathBuf> {
     Some(base.join("glacia").join("config.toml"))
 }
 
+/// Platform plugins directory.
+/// - Windows: `%APPDATA%\glacia\plugins\`
+/// - Unix: `$XDG_CONFIG_HOME/glacia/plugins/` or `~/.config/glacia/plugins/`
+pub fn plugins_dir() -> Option<PathBuf> {
+    let base = if cfg!(windows) {
+        var_os("APPDATA").map(PathBuf::from)
+    } else {
+        var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+    }?;
+    Some(base.join("glacia").join("plugins"))
+}
+
 /// Safe built-in primary monospace font for this platform.
 ///
 /// Each choice ships with the OS and requires no extra installs. Users can
