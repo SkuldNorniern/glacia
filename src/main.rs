@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
+use aurea::clipboard_text;
 use aurea::ffi::ng_platform_poll_events;
 use aurea::render::{Canvas, Font, RendererBackend};
 use aurea::{AureaResult, KeyCode, Window, WindowEvent};
@@ -166,38 +167,82 @@ fn main() -> AureaResult<()> {
                     pressed: true,
                     modifiers,
                 } => {
-                    let visible_rows = (window_size.1 as f32 / metrics.height).max(1.0) as usize;
-                    let scroll_page = visible_rows / 2;
-                    match key {
-                        KeyCode::PageUp => {
-                            let max_scroll = term.scrollback_rows().len();
-                            scroll_offset = (scroll_offset + scroll_page).min(max_scroll);
+                    // Ctrl+Shift+V: paste clipboard with optional bracketed-paste wrapping.
+                    if modifiers.ctrl && modifiers.shift && *key == KeyCode::V {
+                        if let Some(text) = clipboard_text() {
+                            scroll_offset = 0;
+                            if term.bracketed_paste_enabled() {
+                                let _ = term.write_str("\x1b[200~");
+                                let _ = term.write_str(&text);
+                                let _ = term.write_str("\x1b[201~");
+                            } else {
+                                let _ = term.write_str(&text);
+                            }
+                            cursor_visible = true;
+                            last_blink = Instant::now();
                             needs_redraw = true;
                         }
-                        KeyCode::PageDown => {
-                            scroll_offset = scroll_offset.saturating_sub(scroll_page);
+                    } else if term.is_alt_screen() {
+                        // On the alternate screen the app owns scrolling; route
+                        // PageUp/Down as standard VT sequences so vim/less/htop
+                        // can respond. Other keys fall through to normal routing.
+                        let forwarded = match key {
+                            KeyCode::PageUp => Some("\x1b[5~"),
+                            KeyCode::PageDown => Some("\x1b[6~"),
+                            _ => None,
+                        };
+                        if let Some(seq) = forwarded {
+                            let _ = term.write_str(seq);
+                            cursor_visible = true;
+                            last_blink = Instant::now();
+                            needs_redraw = true;
+                        } else if let Some(bytes) = input::terminal_key_bytes(*key, *modifiers) {
+                            let _ = term.write_str(bytes);
+                            cursor_visible = true;
+                            last_blink = Instant::now();
                             needs_redraw = true;
                         }
-                        _ => {
-                            if let Some(bytes) = input::terminal_key_bytes(*key, *modifiers) {
-                                scroll_offset = 0;
-                                let _ = term.write_str(bytes);
-                                cursor_visible = true;
-                                last_blink = Instant::now();
+                    } else {
+                        let visible_rows =
+                            (window_size.1 as f32 / metrics.height).max(1.0) as usize;
+                        let scroll_page = visible_rows / 2;
+                        match key {
+                            KeyCode::PageUp => {
+                                let max_scroll = term.scrollback_rows().len();
+                                scroll_offset = (scroll_offset + scroll_page).min(max_scroll);
                                 needs_redraw = true;
+                            }
+                            KeyCode::PageDown => {
+                                scroll_offset = scroll_offset.saturating_sub(scroll_page);
+                                needs_redraw = true;
+                            }
+                            _ => {
+                                if let Some(bytes) = input::terminal_key_bytes(*key, *modifiers) {
+                                    scroll_offset = 0;
+                                    let _ = term.write_str(bytes);
+                                    cursor_visible = true;
+                                    last_blink = Instant::now();
+                                    needs_redraw = true;
+                                }
                             }
                         }
                     }
                 }
                 WindowEvent::MouseWheel { delta_y, .. } => {
-                    let lines = (delta_y.abs() * 3.0).ceil() as usize;
-                    if *delta_y < 0.0 {
-                        let max_scroll = term.scrollback_rows().len();
-                        scroll_offset = (scroll_offset + lines).min(max_scroll);
+                    if term.is_alt_screen() {
+                        // App manages scrolling — don't steal mouse wheel for
+                        // Glacia's viewport. Forwarding mouse wheel events as
+                        // proper X10/SGR mouse reports is future work.
                     } else {
-                        scroll_offset = scroll_offset.saturating_sub(lines);
+                        let lines = (delta_y.abs() * 3.0).ceil() as usize;
+                        if *delta_y < 0.0 {
+                            let max_scroll = term.scrollback_rows().len();
+                            scroll_offset = (scroll_offset + lines).min(max_scroll);
+                        } else {
+                            scroll_offset = scroll_offset.saturating_sub(lines);
+                        }
+                        needs_redraw = true;
                     }
-                    needs_redraw = true;
                 }
                 WindowEvent::TextInput { text } => {
                     let printable: String = text.chars().filter(|c| !c.is_control()).collect();
@@ -220,6 +265,11 @@ fn main() -> AureaResult<()> {
             cursor_visible = true;
             last_blink = Instant::now();
             needs_redraw = true;
+            // Entering alt screen (TUI app launched): clear any existing
+            // scrollback offset so the full alt-screen is immediately visible.
+            if term.is_alt_screen() {
+                scroll_offset = 0;
+            }
 
             let title = term.title();
             if title != last_title {
