@@ -24,23 +24,44 @@ use vanta::Cell;
 const POLL_INTERVAL: Duration = Duration::from_millis(8);
 const DEFAULT_TITLE: &str = "Glacia";
 
-/// Measure the font's actual horizontal advance for a representative glyph
-/// rather than guessing `font_size * 0.6` — the guess drifts visibly from
-/// the real rendered text over enough columns (the cursor block creeps away
-/// from the character it should sit on). Falls back to the guess if
-/// measurement fails or returns something degenerate.
-fn cell_metrics(config: &Config, canvas: &Arc<Mutex<SendableCanvas>>, font: &Font) -> CellMetrics {
+/// Measure font metrics and build the cell sizing struct.
+///
+/// Width comes from the actual advance of 'M' so the cursor stays aligned with
+/// the rendered glyphs. Height and baseline_offset come from the font's true
+/// ascent+descent rather than a fixed fraction, preventing the last row's
+/// descenders from being clipped at the canvas edge. Also probes which
+/// codepoints the primary font lacks so fallback routing is automatic.
+fn cell_metrics(
+    config: &Config,
+    canvas: &Arc<Mutex<SendableCanvas>>,
+    row_fonts: &mut RowFonts,
+) -> CellMetrics {
+    let configured_h = config.font.size * config.font.line_height;
     let mut width = config.font.size * 0.6;
+    let mut height = configured_h;
+    let mut baseline_offset = configured_h * 0.8;
+
     let _ = lock(canvas.as_ref()).draw(|ctx| {
-        let measured = ctx.measure_text("M", font)?;
-        if measured.advance > 0.0 {
-            width = measured.advance;
+        if let Ok(m) = ctx.measure_text("M", &row_fonts.primary) {
+            if m.advance > 0.0 {
+                width = m.advance;
+            }
+            if m.ascent > 0.0 {
+                let font_h = m.ascent + m.descent;
+                let leading = font_h * (config.font.line_height - 1.0);
+                // Centre the line_height gap evenly above and below the glyph.
+                baseline_offset = leading / 2.0 + m.ascent;
+                height = font_h + leading;
+            }
         }
+        row_fonts.probe(ctx, width);
         Ok(())
     });
+
     CellMetrics {
         width,
-        height: config.font.size * config.font.line_height,
+        height,
+        baseline_offset,
     }
 }
 
@@ -123,8 +144,10 @@ fn main() -> AureaResult<()> {
     } else {
         Some(Font::new(&config.font.fallback, config.font.size))
     };
-    let metrics = cell_metrics(&config, &canvas_arc, &primary_font);
-    let row_fonts = RowFonts::new(primary_font, fallback_font);
+    // Build RowFonts first so cell_metrics can probe font support in the same
+    // canvas draw call that measures the cell width.
+    let mut row_fonts = RowFonts::new(primary_font, fallback_font);
+    let metrics = cell_metrics(&config, &canvas_arc, &mut row_fonts);
 
     let (cols, rows) = grid_size(config.window.width, config.window.height, &metrics);
     let mut term = match TerminalSession::spawn(SpawnOverrides {
