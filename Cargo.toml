@@ -12,3 +12,5 @@ unwrap_used = "warn"
 expect_used = "warn"
 
 [dependencies]
+aurea = { git = "https://github.com/SkuldNorniern/aurea" }
+vanta = { git = "https://github.com/SkuldNorniern/vanta", default-features = false, features = ["portable"] }
