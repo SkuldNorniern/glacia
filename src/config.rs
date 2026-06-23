@@ -57,12 +57,23 @@ pub struct TerminalConfig {
     pub working_directory: String,
 }
 
-/// Cursor shape is always a block today — `render_cpu` doesn't draw any
-/// other shape yet, so there's nothing to configure until it does.
+/// Cursor rendering shape.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum CursorShape {
+    /// Solid block covering the whole cell.
+    #[default]
+    Block,
+    /// Thin vertical bar at the left edge of the cell.
+    Beam,
+    /// Thin horizontal bar at the bottom of the cell.
+    Underline,
+}
+
 #[derive(Debug, Clone)]
 pub struct CursorConfig {
     pub blink: bool,
     pub blink_interval_ms: u64,
+    pub shape: CursorShape,
 }
 
 impl Default for CursorConfig {
@@ -70,6 +81,7 @@ impl Default for CursorConfig {
         Self {
             blink: true,
             blink_interval_ms: 530,
+            shape: CursorShape::Block,
         }
     }
 }
@@ -159,6 +171,13 @@ impl Config {
             if let Some(v) = as_u64(cursor.get("blink_interval_ms")) {
                 config.cursor.blink_interval_ms = v.max(1);
             }
+            if let Some(v) = cursor.get("shape").and_then(Value::as_str) {
+                config.cursor.shape = match v {
+                    "beam" => CursorShape::Beam,
+                    "underline" => CursorShape::Underline,
+                    _ => CursorShape::Block,
+                };
+            }
         }
 
         (config, None)
@@ -227,6 +246,7 @@ fn write_default_template(path: &Path) -> Option<String> {
 [cursor]
 # blink             = true
 # blink_interval_ms = 530
+# shape             = \"block\"   # block | beam | underline
 "
     );
 
