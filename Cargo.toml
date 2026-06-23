@@ -16,3 +16,6 @@ aurea = { git = "https://github.com/SkuldNorniern/aurea" }
 vanta = { git = "https://github.com/SkuldNorniern/vanta" }
 toml = "0.9"
 
+[build-dependencies]
+winres = "0.1"
+
