@@ -11,12 +11,13 @@ use std::time::{Duration, Instant};
 
 use aurea::ffi::ng_platform_poll_events;
 use aurea::render::{Canvas, Font, RendererBackend};
-use aurea::{AureaResult, Window, WindowEvent};
+use aurea::{AureaResult, KeyCode, Window, WindowEvent};
 
 use canvas::{SendableCanvas, SharedCanvas, lock};
 use config::Config;
 use render_cpu::CellMetrics;
 use terminal::{SpawnOverrides, TerminalSession};
+use vanta::Cell;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(8);
 const DEFAULT_TITLE: &str = "Glacia";
@@ -133,6 +134,7 @@ fn main() -> AureaResult<()> {
     let mut needs_redraw = true;
     let mut window_size = (config.window.width, config.window.height);
     let mut last_title: Option<String> = None;
+    let mut scroll_offset: usize = 0;
 
     loop {
         unsafe { ng_platform_poll_events() };
@@ -153,16 +155,33 @@ fn main() -> AureaResult<()> {
                     pressed: true,
                     modifiers,
                 } => {
-                    if let Some(bytes) = input::terminal_key_bytes(*key, *modifiers) {
-                        let _ = term.write_str(bytes);
-                        cursor_visible = true;
-                        last_blink = Instant::now();
-                        needs_redraw = true;
+                    let visible_rows = (window_size.1 as f32 / metrics.height).max(1.0) as usize;
+                    let scroll_page = visible_rows / 2;
+                    match key {
+                        KeyCode::PageUp => {
+                            let max_scroll = term.scrollback_rows().len();
+                            scroll_offset = (scroll_offset + scroll_page).min(max_scroll);
+                            needs_redraw = true;
+                        }
+                        KeyCode::PageDown => {
+                            scroll_offset = scroll_offset.saturating_sub(scroll_page);
+                            needs_redraw = true;
+                        }
+                        _ => {
+                            if let Some(bytes) = input::terminal_key_bytes(*key, *modifiers) {
+                                scroll_offset = 0;
+                                let _ = term.write_str(bytes);
+                                cursor_visible = true;
+                                last_blink = Instant::now();
+                                needs_redraw = true;
+                            }
+                        }
                     }
                 }
                 WindowEvent::TextInput { text } => {
                     let printable: String = text.chars().filter(|c| !c.is_control()).collect();
                     if !printable.is_empty() {
+                        scroll_offset = 0;
                         let _ = term.write_str(&printable);
                         cursor_visible = true;
                         last_blink = Instant::now();
@@ -209,14 +228,40 @@ fn main() -> AureaResult<()> {
             // that re-runs the registered `set_draw_callback` (background
             // only) and clobbers this frame's real content.
             canvas.draw(|ctx| {
-                render_cpu::draw_grid(
-                    ctx,
-                    term.cells(),
-                    term.cursor(),
-                    cursor_visible,
-                    &metrics,
-                    &font,
-                )?;
+                let visible_rows = (window_size.1 as f32 / metrics.height).max(1.0) as usize;
+                if scroll_offset == 0 {
+                    render_cpu::draw_grid(
+                        ctx,
+                        term.cells(),
+                        term.cursor(),
+                        cursor_visible,
+                        &metrics,
+                        &font,
+                    )?;
+                } else {
+                    let sb = term.scrollback_rows();
+                    let screen = term.cells();
+                    let total = sb.len() + screen.len();
+                    let end = total.saturating_sub(scroll_offset);
+                    let start = end.saturating_sub(visible_rows);
+                    let view: Vec<Vec<Cell>> = (start..end)
+                        .map(|i| {
+                            if i < sb.len() {
+                                sb[i].clone()
+                            } else {
+                                screen[i - sb.len()].clone()
+                            }
+                        })
+                        .collect();
+                    render_cpu::draw_grid(
+                        ctx,
+                        &view,
+                        (usize::MAX, usize::MAX),
+                        false,
+                        &metrics,
+                        &font,
+                    )?;
+                }
                 if let Some(message) = diagnostics.first() {
                     render_cpu::draw_diagnostics_banner(
                         ctx,

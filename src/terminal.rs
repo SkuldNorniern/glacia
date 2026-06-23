@@ -11,6 +11,7 @@ use vanta::{Cell, Terminal};
 pub struct TerminalSession {
     term: Terminal,
     last_version: u64,
+    scrollback: Vec<Vec<Cell>>,
     cells: Vec<Vec<Cell>>,
     cursor: (usize, usize),
 }
@@ -38,6 +39,7 @@ impl TerminalSession {
         Ok(Self {
             term,
             last_version: 0,
+            scrollback: Vec::new(),
             cells: Vec::new(),
             cursor: (0, 0),
         })
@@ -55,12 +57,17 @@ impl TerminalSession {
         self.last_version = snapshot.version;
         let (line, col) = snapshot.cursor;
         self.cursor = (line.saturating_sub(snapshot.scrollback.len()), col);
+        self.scrollback = snapshot.scrollback;
         self.cells = snapshot.screen;
         true
     }
 
     pub fn cells(&self) -> &[Vec<Cell>] {
         &self.cells
+    }
+
+    pub fn scrollback_rows(&self) -> &[Vec<Cell>] {
+        &self.scrollback
     }
 
     pub fn cursor(&self) -> (usize, usize) {
