@@ -269,19 +269,27 @@ fn main() -> AureaResult<()> {
                     }
                 }
                 WindowEvent::MouseWheel { delta_y, .. } => {
+                    // macOS delivers natural-scroll deltas: positive = fingers
+                    // moving up = content moves up = older lines come into view.
+                    // Traditional (Windows/Linux) is the opposite sign convention.
+                    #[cfg(target_os = "macos")]
+                    let scroll_up = *delta_y > 0.0;
+                    #[cfg(not(target_os = "macos"))]
+                    let scroll_up = *delta_y < 0.0;
+
                     if term.is_alt_screen() {
                         // Forward wheel as arrow-key repeats so vim/less/htop
                         // scroll naturally. The app sees the same sequences it
                         // would receive from keyboard arrow presses.
                         let lines = (delta_y.abs() * 3.0).ceil() as usize;
-                        let seq = if *delta_y < 0.0 { "\x1b[A" } else { "\x1b[B" };
+                        let seq = if scroll_up { "\x1b[A" } else { "\x1b[B" };
                         for _ in 0..lines {
                             let _ = term.write_str(seq);
                         }
                         needs_redraw = true;
                     } else {
                         let lines = (delta_y.abs() * 3.0).ceil() as usize;
-                        if *delta_y < 0.0 {
+                        if scroll_up {
                             let max_scroll = term.scrollback_rows().len();
                             scroll_offset = (scroll_offset + lines).min(max_scroll);
                         } else {
