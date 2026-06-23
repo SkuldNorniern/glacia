@@ -233,6 +233,12 @@ fn main() -> AureaResult<()> {
             needs_redraw = true;
         }
 
+        // TUI apps (vim, htop, …) hide the cursor via DECTCEM and draw their
+        // own. Override the blink state so we never draw a ghost block on top.
+        if !term.app_cursor_visible() {
+            cursor_visible = false;
+        }
+
         if !term.is_running() {
             break;
         }
