@@ -1,4 +1,5 @@
 use std::env::var_os;
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 /// Platform user config path.
@@ -56,6 +57,21 @@ fn which_exe(name: &str) -> bool {
         }
     }
     false
+}
+
+/// Extra args passed to the shell on Unix so it starts as a login shell,
+/// sourcing `/etc/profile`, `~/.zprofile`, `~/.bash_profile`, etc.
+/// Without this, GUI-launched apps inherit a bare system PATH that omits
+/// Homebrew, pyenv, cargo, and any other user-installed tool directories.
+pub fn shell_args() -> Vec<OsString> {
+    #[cfg(unix)]
+    {
+        vec![OsString::from("-l")]
+    }
+    #[cfg(not(unix))]
+    {
+        vec![]
+    }
 }
 
 /// Safe built-in primary monospace font for this platform.

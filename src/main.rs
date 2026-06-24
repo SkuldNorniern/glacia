@@ -219,6 +219,7 @@ fn main() -> AureaResult<()> {
         cols,
         rows,
         shell: &resolved_shell,
+        args: platform::shell_args(),
         working_directory: &config.terminal.working_directory,
     }) {
         Ok(term) => term,
