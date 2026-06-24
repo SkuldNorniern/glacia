@@ -15,6 +15,9 @@ pub struct TerminalSession {
     scrollback: Vec<Vec<Cell>>,
     cells: Vec<Vec<Cell>>,
     cursor: (usize, usize),
+    /// Cached terminal width so `sync` can clamp the cursor column when the
+    /// VT is in "pending wrap" state (cx == cols after filling the last cell).
+    screen_cols: usize,
     cursor_visible: bool,
     is_alt_screen: bool,
     bracketed_paste: bool,
@@ -46,6 +49,7 @@ impl TerminalSession {
             scrollback: Vec::new(),
             cells: Vec::new(),
             cursor: (0, 0),
+            screen_cols: overrides.cols as usize,
             cursor_visible: true,
             is_alt_screen: false,
             bracketed_paste: false,
@@ -63,6 +67,9 @@ impl TerminalSession {
         }
         self.last_version = snapshot.version;
         let (line, col) = snapshot.cursor;
+        // Vanta's cx reaches `cols` in "pending wrap" state (last column filled,
+        // wrap not yet triggered). Clamp so the cursor block stays on-screen.
+        let col = col.min(self.screen_cols.saturating_sub(1));
         self.cursor = (line.saturating_sub(snapshot.scrollback.len()), col);
         self.scrollback = snapshot.scrollback;
         self.cells = snapshot.screen;
@@ -107,7 +114,8 @@ impl TerminalSession {
         self.term.write_str(s)
     }
 
-    pub fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {
+    pub fn resize(&mut self, cols: u16, rows: u16) -> io::Result<()> {
+        self.screen_cols = cols as usize;
         self.term.resize(cols, rows)
     }
 
