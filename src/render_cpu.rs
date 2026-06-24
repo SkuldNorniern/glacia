@@ -145,18 +145,29 @@ impl RowFonts {
         }
 
         let probes: &[char] = &[
+            // Box Drawing (U+2500-U+257F) — heavily used by htop, vim, tmux, etc.
+            '─', '│', '┌', '┐', '└', '┘', '├', '┤', '┬', '┴', '┼',
+            '╔', '╗', '╚', '╝', '║', '═', '╠', '╣', '╦', '╩', '╬',
+            // Block Elements (U+2580-U+259F) — progress bars, borders, fills
+            '▀', '▄', '█', '▌', '▐', '░', '▒', '▓',
             // Braille Patterns (U+2800-U+28FF) — common in terminal UIs
-            '⠀', '⠋', '⠿', // Miscellaneous Symbols (U+2600-U+26FF)
-            '☀', '☁', '★', '☆', '☑', '☒', '♥', '♦', // Dingbats (U+2700-U+27BF)
+            '⠀', '⠋', '⠿',
+            // Miscellaneous Symbols (U+2600-U+26FF)
+            '☀', '☁', '★', '☆', '☑', '☒', '♥', '♦',
+            // Dingbats (U+2700-U+27BF)
             '✓', '✗', '✦', '✧', '➔', '➜',
             // Supplemental Arrows-B / Misc Math (U+27C0-U+27EF)
-            '⟹', '⟺', // Miscellaneous Technical (U+2300-U+23FF)
-            '⌨', '⌚', '⌛', '⏎', '⏳', // Mathematical Operators (U+2200-U+22FF)
+            '⟹', '⟺',
+            // Miscellaneous Technical (U+2300-U+23FF)
+            '⌨', '⌚', '⌛', '⏎', '⏳',
+            // Mathematical Operators (U+2200-U+22FF)
             '∀', '∂', '∑', '∞', '∇', '∈', '∉', '≈', '≠', '≤', '≥',
             // Geometric Shapes (U+25A0-U+25FF)
             '◆', '◇', '◈', '▲', '▼', '◀', '▶',
             // Number Forms / Letterlike (U+2100-U+214F)
             '™', '©', '®', '℃', '℉',
+            // Enclosed Alphanumerics (U+2460-U+24FF) — circled numbers/letters
+            '①', '②', '③', '⑩', 'Ⓐ',
         ];
 
         // Tolerance: glyphs whose advance is within 1px of notdef are considered missing.
@@ -206,18 +217,28 @@ fn static_needs_fallback(c: char) -> bool {
     let n = c as u32;
     matches!(
         n,
-        0x1100..=0x11FF   // Hangul Jamo
-        | 0x2800..=0x28FF // Braille Patterns
-        | 0x2E80..=0x303F // CJK Radicals, Kangxi, Symbols & Punctuation
-        | 0x3040..=0x9FFF // Kana, Bopomofo, CJK unified block
-        | 0xA000..=0xA4CF // Yi
-        | 0xA960..=0xA97F // Hangul Jamo Extended-A
-        | 0xAC00..=0xD7FF // Hangul Syllables + Jamo Extended-B
-        | 0xF900..=0xFAFF // CJK Compatibility Ideographs
-        | 0xFE30..=0xFE4F // CJK Compatibility Forms
-        | 0xFF00..=0xFFEF // Halfwidth and Fullwidth Forms
-        | 0x1B000..=0x1B0FF // Kana Supplement
-        | 0x1F300..=0x1FAFF // Emoji and pictographs
+        0x1100..=0x11FF     // Hangul Jamo
+        | 0x2800..=0x28FF   // Braille Patterns
+        | 0x2E80..=0x303F   // CJK Radicals, Kangxi, Symbols & Punctuation
+        | 0x3040..=0x9FFF   // Kana, Bopomofo, CJK unified block
+        | 0xA000..=0xA4CF   // Yi
+        | 0xA960..=0xA97F   // Hangul Jamo Extended-A
+        | 0xAC00..=0xD7FF   // Hangul Syllables + Jamo Extended-B
+        | 0xF900..=0xFAFF   // CJK Compatibility Ideographs
+        | 0xFE30..=0xFE4F   // CJK Compatibility Forms
+        | 0xFF00..=0xFFEF   // Halfwidth and Fullwidth Forms
+        // ── Supplementary Multilingual Plane ───────────────────────────────
+        | 0x1B000..=0x1B1FF // Kana Supplement + Kana Extended-A
+        | 0x1F000..=0x1F02F // Mahjong Tiles
+        | 0x1F0A0..=0x1F0FF // Playing Cards
+        | 0x1F200..=0x1F2FF // Enclosed CJK Letters and Months
+        | 0x1F300..=0x1FAFF // Emoji, pictographs, symbols (main block)
+        | 0x1FB00..=0x1FBFF // Symbols for Legacy Computing (block sextants, etc.)
+        // ── CJK Extension B–G (Supplementary Ideographic Plane) ───────────
+        | 0x20000..=0x2A6DF // CJK Extension B
+        | 0x2A700..=0x2CEAF // CJK Extension C / D / E
+        | 0x2CEB0..=0x2EBEF // CJK Extension F
+        | 0x30000..=0x3134F // CJK Extension G
     )
 }
 
@@ -332,9 +353,17 @@ fn draw_row(
         }
     }
 
-    // Pass 3: text runs — batched by (fg, bold, italic, fallback) for fewer draw calls
+    // Pass 3: text runs — batched by (fg, bold, italic, fallback) for fewer draw calls.
+    // Continuation cells (right half of width-2 glyphs) are skipped at the outer
+    // level: including them in a run would mis-position every character that follows.
     let mut i = 0usize;
     while i < row.len() {
+        // Skip continuation cells — they carry no content and would shift the
+        // x-origin of the subsequent run one column to the left.
+        if matches!(row[i].kind, CellKind::Continuation) {
+            i += 1;
+            continue;
+        }
         let (fg, _) = resolve_pair(&row[i]);
         let bold = row[i].attrs.contains(Attrs::BOLD);
         let italic = row[i].attrs.contains(Attrs::ITALIC);
@@ -346,6 +375,7 @@ fn draw_row(
             && row[i].attrs.contains(Attrs::BOLD) == bold
             && row[i].attrs.contains(Attrs::ITALIC) == italic
             && cell_needs_fallback(&row[i], fonts) == use_fallback
+            && !matches!(row[i].kind, CellKind::Continuation)
         {
             push_cell_text(&mut text, &row[i]);
             i += 1;
@@ -353,10 +383,12 @@ fn draw_row(
         if text.trim_end().is_empty() {
             continue;
         }
-        let x = start as f32 * metrics.width + x_offset;
+        // Round to the nearest pixel: Direct2D (Windows) produces crisper glyph
+        // outlines when text origins land on integer device coordinates.
+        let x = (start as f32 * metrics.width + x_offset).round();
         ctx.draw_text_with_font(
             &text,
-            Point::new(x, baseline),
+            Point::new(x, baseline.round()),
             fonts.pick(bold, italic, use_fallback),
             &solid(fg),
         )?;
@@ -437,7 +469,7 @@ pub fn draw_grid(
                             let char_color = theme::resolve(cell.bg, theme::BACKGROUND);
                             ctx.draw_text_with_font(
                                 &text,
-                                Point::new(x, y + metrics.baseline_offset),
+                                Point::new(x.round(), (y + metrics.baseline_offset).round()),
                                 fonts.pick(bold, italic, use_fallback),
                                 &solid(char_color),
                             )?;
