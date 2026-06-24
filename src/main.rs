@@ -1,3 +1,8 @@
+// Release builds run as a GUI app — without this, Windows allocates a console
+// window alongside the terminal's own window. Kept active in debug builds so
+// `cargo run` still shows panics/stderr in the launching console.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod canvas;
 mod config;
 mod input;
@@ -384,12 +389,18 @@ fn main() -> AureaResult<()> {
                     }
                 }
                 WindowEvent::MouseWheel { delta_y, .. } => {
-                    // macOS delivers natural-scroll deltas: positive = fingers
-                    // moving up = content moves up = older lines come into view.
-                    // Traditional (Windows/Linux) is the opposite sign convention.
-                    #[cfg(target_os = "macos")]
+                    // Sign convention differs per native backend, not just per OS:
+                    // - macOS (NSEvent, natural scroll): positive = fingers moving
+                    //   up = content moves up = older lines come into view.
+                    // - Windows (WM_MOUSEWHEEL, both mouse wheel and Precision
+                    //   Touchpad): GET_WHEEL_DELTA_WPARAM is positive for the
+                    //   "away from user" rotation, which also means scroll up —
+                    //   same convention as macOS.
+                    // - Linux (GTK GdkEventScroll): dy is negative for
+                    //   GDK_SCROLL_UP — the opposite convention.
+                    #[cfg(any(target_os = "macos", target_os = "windows"))]
                     let scroll_up = *delta_y > 0.0;
-                    #[cfg(not(target_os = "macos"))]
+                    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
                     let scroll_up = *delta_y < 0.0;
 
                     if term.is_alt_screen() {
