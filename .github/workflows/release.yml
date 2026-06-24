@@ -17,6 +17,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: glacia
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: glacia
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact: glacia.exe
@@ -39,6 +45,13 @@ jobs:
           key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-${{ matrix.target }}-cargo-
 
+      - name: Install Linux system deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libvulkan-dev libxcb-xfixes0-dev libxcb-shape0-dev \
+            libxkbcommon-dev pkg-config libegl-mesa0 libgtk-3-dev
+
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
 
@@ -48,18 +61,56 @@ jobs:
           BINARY=target/${{ matrix.target }}/release/${{ matrix.artifact }}
           ARCHIVE=glacia-${{ github.ref_name }}-${{ matrix.target }}
 
-          mkdir -p dist
-          cp "$BINARY" dist/
-          cd dist && 7z a "../${ARCHIVE}.zip" ${{ matrix.artifact }} && cd ..
-          sha256sum "${ARCHIVE}.zip" > "${ARCHIVE}.zip.sha256"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            mkdir -p dist
+            cp "$BINARY" dist/
+            cd dist && 7z a "../${ARCHIVE}.zip" ${{ matrix.artifact }} && cd ..
+            sha256sum "${ARCHIVE}.zip" > "${ARCHIVE}.zip.sha256"
+          elif [[ "${{ runner.os }}" == "macOS" ]]; then
+            # Build .icns from PNG assets
+            mkdir -p Glacia.iconset
+            sips -z 16 16   assets/glacia-term-icon.png   --out Glacia.iconset/icon_16x16.png
+            sips -z 32 32   assets/glacia-term-icon.png   --out Glacia.iconset/icon_16x16@2x.png
+            sips -z 32 32   assets/glacia-term-icon.png   --out Glacia.iconset/icon_32x32.png
+            sips -z 64 64   assets/glacia-term-icon.png   --out Glacia.iconset/icon_32x32@2x.png
+            sips -z 128 128 assets/glacia-term-icon.png   --out Glacia.iconset/icon_128x128.png
+            sips -z 256 256 assets/glacia-term-icon-256.png --out Glacia.iconset/icon_128x128@2x.png
+            sips -z 256 256 assets/glacia-term-icon-256.png --out Glacia.iconset/icon_256x256.png
+            sips -z 512 512 assets/glacia-term-icon-512.png --out Glacia.iconset/icon_256x256@2x.png
+            sips -z 512 512 assets/glacia-term-icon-512.png --out Glacia.iconset/icon_512x512.png
+            iconutil -c icns Glacia.iconset -o packaging/macos/glacia.icns
+            # Assemble .app bundle
+            mkdir -p Glacia.app/Contents/MacOS
+            mkdir -p Glacia.app/Contents/Resources
+            cp "$BINARY" Glacia.app/Contents/MacOS/glacia
+            cp packaging/macos/Info.plist Glacia.app/Contents/
+            cp packaging/macos/glacia.icns Glacia.app/Contents/Resources/
+            chmod +x Glacia.app/Contents/MacOS/glacia
+            plutil -lint Glacia.app/Contents/Info.plist
+            codesign --force --deep --sign - Glacia.app
+            codesign --verify --deep --strict --verbose=2 Glacia.app
+            # Create DMG
+            hdiutil create -volname "Glacia" -srcfolder Glacia.app \
+              -ov -format UDZO "${ARCHIVE}.dmg"
+            sha256sum "${ARCHIVE}.dmg" > "${ARCHIVE}.dmg.sha256"
+          else
+            mkdir -p dist
+            cp "$BINARY" dist/
+            tar -czf "${ARCHIVE}.tar.gz" -C dist .
+            sha256sum "${ARCHIVE}.tar.gz" > "${ARCHIVE}.tar.gz.sha256"
+          fi
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: glacia-${{ matrix.target }}
           path: |
+            *.tar.gz
+            *.tar.gz.sha256
             *.zip
             *.zip.sha256
+            *.dmg
+            *.dmg.sha256
           if-no-files-found: error
 
   release:
@@ -124,7 +175,9 @@ jobs:
           prerelease: ${{ contains(github.ref_name, '-') }}
           title: "Glacia ${{ github.ref_name }}"
           files: |
+            artifacts/*.tar.gz
             artifacts/*.zip
+            artifacts/*.dmg
             checksums.sha256
 
       - name: Update release notes with changelog and downloads table
@@ -142,8 +195,10 @@ jobs:
             echo "|----------|------|--------|"
             while read -r hash file; do
               case "$file" in
-                *windows*) platform="Windows x86_64" ;;
-                *)         platform="Other"           ;;
+                *linux*)   platform="Linux x86_64"   ;;
+                *darwin*)  platform="macOS ARM64"     ;;
+                *windows*) platform="Windows x86_64"  ;;
+                *)         platform="Other"            ;;
               esac
               echo "| $platform | \`$file\` | \`${hash:0:16}...\` |"
             done < checksums.sha256
