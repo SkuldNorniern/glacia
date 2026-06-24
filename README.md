@@ -30,8 +30,8 @@ Glacia reads its config from the standard config directory on each platform:
 | Platform | Path |
 |----------|------|
 | Linux    | `~/.config/glacia/config.toml` |
-| macOS    | `~/Library/Application Support/glacia/config.toml` |
-| Windows  | `%APPDATA%\Roaming\glacia\config.toml` |
+| macOS    | `~/.config/glacia/config.toml` |
+| Windows  | `%APPDATA%\glacia\config.toml` |
 
 ## License
 
