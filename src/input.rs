@@ -5,6 +5,25 @@
 //! `alt_sequence` for letter keys allocates a two-byte heap string.
 
 use aurea::{KeyCode, Modifiers};
+#[cfg(windows)]
+use std::ptr::null_mut;
+
+#[cfg(windows)]
+const CP949: u32 = 949;
+#[cfg(windows)]
+const MB_ERR_INVALID_CHARS: u32 = 0x0000_0008;
+
+#[cfg(windows)]
+unsafe extern "system" {
+    fn MultiByteToWideChar(
+        code_page: u32,
+        flags: u32,
+        multi_byte_str: *const u8,
+        multi_byte_len: i32,
+        wide_char_str: *mut u16,
+        wide_char_len: i32,
+    ) -> i32;
+}
 
 /// Return the bytes to write to the PTY for a key press, or `None` if the key
 /// should be handled elsewhere (e.g. printable text via `TextInput`).
@@ -64,6 +83,80 @@ fn ctrl_sequence(key: KeyCode, shift: bool) -> Option<&'static str> {
         KeyCode::Left => Some("\x1b[1;5D"),
         _ => None,
     }
+}
+
+pub fn normalize_text_input(text: &str) -> String {
+    #[cfg(windows)]
+    {
+        repair_cp949_mojibake(text).unwrap_or_else(|| text.to_owned())
+    }
+    #[cfg(not(windows))]
+    {
+        text.to_owned()
+    }
+}
+
+#[cfg(windows)]
+fn repair_cp949_mojibake(text: &str) -> Option<String> {
+    if text.chars().any(is_hangul) {
+        return None;
+    }
+
+    let mut saw_high_byte = false;
+    let mut bytes = Vec::with_capacity(text.len());
+    for ch in text.chars() {
+        let code = ch as u32;
+        if code > 0xFF {
+            return None;
+        }
+        saw_high_byte |= code >= 0x80;
+        bytes.push(code as u8);
+    }
+    if !saw_high_byte {
+        return None;
+    }
+
+    let decoded = decode_cp949(&bytes)?;
+    decoded.chars().any(is_hangul).then_some(decoded)
+}
+
+#[cfg(windows)]
+fn decode_cp949(bytes: &[u8]) -> Option<String> {
+    let len = i32::try_from(bytes.len()).ok()?;
+    let needed = unsafe {
+        MultiByteToWideChar(
+            CP949,
+            MB_ERR_INVALID_CHARS,
+            bytes.as_ptr(),
+            len,
+            null_mut(),
+            0,
+        )
+    };
+    if needed <= 0 {
+        return None;
+    }
+
+    let mut wide = vec![0u16; needed as usize];
+    let written = unsafe {
+        MultiByteToWideChar(
+            CP949,
+            MB_ERR_INVALID_CHARS,
+            bytes.as_ptr(),
+            len,
+            wide.as_mut_ptr(),
+            needed,
+        )
+    };
+    if written != needed {
+        return None;
+    }
+    String::from_utf16(&wide).ok()
+}
+
+#[cfg(windows)]
+fn is_hangul(c: char) -> bool {
+    matches!(c as u32, 0xAC00..=0xD7A3 | 0x1100..=0x11FF | 0x3130..=0x318F)
 }
 
 /// Alt+key → ESC-prefix sequences (meta / escape-prefix convention).
@@ -144,5 +237,26 @@ fn base_sequence(key: KeyCode, shift: bool) -> Option<&'static str> {
         KeyCode::F11 => Some("\x1b[23~"),
         KeyCode::F12 => Some("\x1b[24~"),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_text_input;
+
+    #[test]
+    #[cfg(windows)]
+    fn repairs_cp949_korean_text_input_mojibake() {
+        let mojibake = "\u{00B0}\u{00A1}\u{00B3}\u{00AA}\u{00B4}\u{00D9}\u{00B6}\u{00F3}";
+        assert_eq!(
+            normalize_text_input(mojibake),
+            "\u{AC00}\u{B098}\u{B2E4}\u{B77C}"
+        );
+    }
+
+    #[test]
+    fn leaves_valid_text_input_unchanged() {
+        assert_eq!(normalize_text_input("abc"), "abc");
+        assert_eq!(normalize_text_input("\u{AC00}\u{B098}"), "\u{AC00}\u{B098}");
     }
 }
