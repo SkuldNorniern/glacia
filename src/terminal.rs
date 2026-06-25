@@ -30,6 +30,7 @@ pub struct SpawnOverrides<'a> {
     pub rows: u16,
     pub shell: &'a str,
     pub args: Vec<OsString>,
+    pub env: Vec<(OsString, OsString)>,
     pub working_directory: &'a str,
 }
 
@@ -40,6 +41,7 @@ impl TerminalSession {
             rows: overrides.rows,
             program: (!overrides.shell.is_empty()).then(|| OsString::from(overrides.shell)),
             args: overrides.args,
+            env: overrides.env,
             cwd: (!overrides.working_directory.is_empty())
                 .then(|| overrides.working_directory.into()),
             ..SpawnConfig::default()
