@@ -34,9 +34,9 @@ impl Default for WindowConfig {
 #[derive(Debug, Clone)]
 pub struct FontConfig {
     pub family: String,
-    /// Secondary font tried for wide/CJK characters the primary lacks.
-    /// Empty means no explicit fallback (let the OS/DirectWrite choose).
-    pub fallback: String,
+    /// Font families tried, in order, when the primary face cannot render a
+    /// cell's text. Empty means use the platform fallback cascade.
+    pub fallbacks: Vec<String>,
     pub size: f32,
     pub line_height: f32,
 }
@@ -45,7 +45,7 @@ impl Default for FontConfig {
     fn default() -> Self {
         Self {
             family: platform::default_primary_font().to_owned(),
-            fallback: String::new(),
+            fallbacks: Vec::new(),
             size: 14.0,
             line_height: 1.25,
         }
@@ -113,6 +113,15 @@ fn as_f32(v: Option<&Value>) -> Option<f32> {
     v.and_then(Value::as_float).map(|f| f as f32)
 }
 
+fn parse_font_fallbacks(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|family| !family.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 impl Config {
     /// Parse a TOML config string, falling back to defaults per missing or
     /// malformed field. Returns the resolved config plus the TOML syntax
@@ -147,7 +156,7 @@ impl Config {
             if let Some(v) = font.get("fallback").and_then(Value::as_str)
                 && !v.trim().is_empty()
             {
-                config.font.fallback = v.to_owned();
+                config.font.fallbacks = parse_font_fallbacks(v);
             }
             if let Some(v) = as_f32(font.get("size"))
                 && v > 0.0
@@ -242,7 +251,7 @@ fn write_default_template(path: &Path) -> Option<String> {
 
 [font]
 # family      = \"{default_font}\"  # \"auto\" uses the platform default monospace
-# fallback    = \"\"                # CJK / emoji fallback, e.g. \"Noto Sans Mono CJK\"
+# fallback    = \"\"                # comma-separated fallback cascade; empty = platform defaults
 # size        = 14.0
 # line_height = 1.25
 

@@ -91,3 +91,39 @@ pub fn default_primary_font() -> &'static str {
         "DejaVu Sans Mono"
     }
 }
+
+/// Built-in font fallback cascade for scripts and symbols commonly missing
+/// from Western monospace faces. The renderer probes these at draw time and
+/// uses the first family that can cover a cell's text.
+pub fn default_fallback_fonts() -> &'static [&'static str] {
+    if cfg!(windows) {
+        &[
+            "Cascadia Mono",
+            "Malgun Gothic",
+            "Microsoft JhengHei UI",
+            "Microsoft YaHei UI",
+            "Yu Gothic UI",
+            "Segoe UI Symbol",
+            "Segoe UI Emoji",
+        ]
+    } else if cfg!(target_os = "macos") {
+        &[
+            "SF Mono",
+            "Apple SD Gothic Neo",
+            "Hiragino Sans",
+            "PingFang SC",
+            "Apple Symbols",
+            "Apple Color Emoji",
+        ]
+    } else {
+        &[
+            "Noto Sans Mono CJK KR",
+            "Noto Sans CJK KR",
+            "Noto Sans CJK JP",
+            "Noto Sans CJK SC",
+            "DejaVu Sans Mono",
+            "Symbola",
+            "Noto Color Emoji",
+        ]
+    }
+}
