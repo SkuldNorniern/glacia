@@ -42,6 +42,29 @@ pub fn terminal_key_bytes(key: KeyCode, mods: Modifiers) -> Option<String> {
     base_sequence(key, mods.shift).map(str::to_owned)
 }
 
+#[derive(Default)]
+pub struct TextInputNormalizer {
+    #[cfg(windows)]
+    pending_ansi: Vec<u8>,
+}
+
+impl TextInputNormalizer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn normalize(&mut self, text: &str) -> String {
+        #[cfg(windows)]
+        {
+            normalize_windows_text_input(&mut self.pending_ansi, text)
+        }
+        #[cfg(not(windows))]
+        {
+            text.to_owned()
+        }
+    }
+}
+
 fn ctrl_sequence(key: KeyCode, shift: bool) -> Option<&'static str> {
     // Ctrl+Shift+Arrow: modifier code 6
     if shift {
@@ -90,6 +113,7 @@ fn ctrl_sequence(key: KeyCode, shift: bool) -> Option<&'static str> {
     }
 }
 
+#[cfg(test)]
 pub fn normalize_text_input(text: &str) -> String {
     #[cfg(windows)]
     {
@@ -102,6 +126,45 @@ pub fn normalize_text_input(text: &str) -> String {
 }
 
 #[cfg(windows)]
+fn normalize_windows_text_input(pending: &mut Vec<u8>, text: &str) -> String {
+    let preferred_pages = preferred_ansi_code_pages();
+    let mut out = String::new();
+
+    for ch in text.chars() {
+        let code = ch as u32;
+        if code > 0xFF || is_strong_script_char(ch) {
+            push_pending_original(&mut out, pending);
+            out.push(ch);
+            continue;
+        }
+
+        let byte = code as u8;
+        if byte < 0x80 && pending.is_empty() {
+            out.push(ch);
+            continue;
+        }
+
+        pending.push(byte);
+
+        if pending.len() == 1 && should_wait_for_ansi_trail_byte(pending[0], &preferred_pages) {
+            continue;
+        }
+
+        if let Some(decoded) = repair_windows_ansi_bytes(pending, &candidate_ansi_code_pages()) {
+            out.push_str(&decoded);
+            pending.clear();
+            continue;
+        }
+
+        if pending.len() >= 2 {
+            push_pending_original(&mut out, pending);
+        }
+    }
+
+    out
+}
+
+#[cfg(all(windows, test))]
 fn repair_windows_ansi_mojibake(text: &str) -> Option<String> {
     if text.chars().any(is_strong_script_char) {
         return None;
@@ -121,28 +184,76 @@ fn repair_windows_ansi_mojibake(text: &str) -> Option<String> {
         return None;
     }
 
-    for code_page in candidate_ansi_code_pages() {
-        let Some(decoded) = decode_code_page(code_page, &bytes) else {
-            continue;
-        };
-        if decoded != text && decoded_is_plausible(code_page, &decoded) {
-            return Some(decoded);
-        }
-    }
-    None
+    repair_windows_ansi_bytes(&bytes, &candidate_ansi_code_pages())
 }
 
 #[cfg(windows)]
-fn candidate_ansi_code_pages() -> Vec<u32> {
+fn repair_windows_ansi_bytes(bytes: &[u8], code_pages: &[u32]) -> Option<String> {
+    let original: String = bytes.iter().copied().map(char::from).collect();
+    let mut best: Option<(u32, String)> = None;
+
+    for &code_page in code_pages {
+        let Some(decoded) = decode_code_page(code_page, bytes) else {
+            continue;
+        };
+        if decoded == original {
+            continue;
+        }
+
+        let score = decoded_score(code_page, &decoded, bytes.len());
+        if score == 0 {
+            continue;
+        }
+
+        let should_replace = best
+            .as_ref()
+            .is_none_or(|(best_score, _)| score > *best_score);
+        if should_replace {
+            best = Some((score, decoded));
+        }
+    }
+
+    best.map(|(_, decoded)| decoded)
+}
+
+#[cfg(windows)]
+fn preferred_ansi_code_pages() -> Vec<u32> {
     let mut pages = Vec::new();
     if let Some(page) = keyboard_layout_ansi_code_page() {
         push_unique(&mut pages, page);
     }
     push_unique(&mut pages, unsafe { GetACP() });
+    pages
+}
+
+#[cfg(windows)]
+fn candidate_ansi_code_pages() -> Vec<u32> {
+    let mut pages = preferred_ansi_code_pages();
     for &page in COMMON_TEXT_INPUT_CODEPAGES {
         push_unique(&mut pages, page);
     }
     pages
+}
+
+#[cfg(windows)]
+fn should_wait_for_ansi_trail_byte(byte: u8, preferred_pages: &[u32]) -> bool {
+    preferred_pages
+        .iter()
+        .any(|&code_page| is_dbcs_lead_byte(code_page, byte))
+}
+
+#[cfg(windows)]
+fn is_dbcs_lead_byte(code_page: u32, byte: u8) -> bool {
+    match code_page {
+        932 => matches!(byte, 0x81..=0x9F | 0xE0..=0xFC),
+        936 | 949 | 950 => matches!(byte, 0x81..=0xFE),
+        _ => false,
+    }
+}
+
+#[cfg(windows)]
+fn push_pending_original(out: &mut String, pending: &mut Vec<u8>) {
+    out.extend(pending.drain(..).map(char::from));
 }
 
 #[cfg(windows)]
@@ -214,17 +325,29 @@ fn decode_code_page(code_page: u32, bytes: &[u8]) -> Option<String> {
 }
 
 #[cfg(windows)]
-fn decoded_is_plausible(code_page: u32, decoded: &str) -> bool {
+fn decoded_score(code_page: u32, decoded: &str, byte_len: usize) -> u32 {
+    let mut score: u32 = decoded.chars().map(|c| script_score(code_page, c)).sum();
+    let char_count = decoded.chars().count();
+    if score > 0 && byte_len > char_count {
+        score += (byte_len - char_count) as u32 * 8;
+    }
+    score
+}
+
+#[cfg(windows)]
+fn script_score(code_page: u32, c: char) -> u32 {
     match code_page {
-        932 => decoded.chars().any(|c| is_kana(c) || is_cjk(c)),
-        936 | 950 => decoded.chars().any(is_cjk),
-        949 => decoded.chars().any(is_hangul),
-        874 => decoded.chars().any(is_thai),
-        1251 => decoded.chars().any(is_cyrillic),
-        1253 => decoded.chars().any(is_greek),
-        1255 => decoded.chars().any(is_hebrew),
-        1256 => decoded.chars().any(is_arabic),
-        _ => decoded.chars().any(is_strong_script_char),
+        932 if is_kana(c) => 6,
+        932 if is_cjk(c) => 7,
+        936 | 950 if is_cjk(c) => 7,
+        949 if is_hangul(c) => 8,
+        874 if is_thai(c) => 7,
+        1251 if is_cyrillic(c) => 7,
+        1253 if is_greek(c) => 7,
+        1255 if is_hebrew(c) => 7,
+        1256 if is_arabic(c) => 7,
+        _ if is_strong_script_char(c) => 1,
+        _ => 0,
     }
 }
 
@@ -366,7 +489,7 @@ fn base_sequence(key: KeyCode, shift: bool) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_text_input;
+    use super::{TextInputNormalizer, normalize_text_input};
 
     #[test]
     #[cfg(windows)]
@@ -376,6 +499,22 @@ mod tests {
             normalize_text_input(mojibake),
             "\u{AC00}\u{B098}\u{B2E4}\u{B77C}"
         );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn repairs_split_korean_ansi_text_input_mojibake() {
+        let mut normalizer = TextInputNormalizer::new();
+        let events = [
+            "\u{00B0}", "\u{00A1}", "\u{00B3}", "\u{00AA}", "\u{00B4}", "\u{00DE}", " ",
+            "\u{00A4}", "\u{00BF}",
+        ];
+        let repaired: String = events
+            .into_iter()
+            .map(|event| normalizer.normalize(event))
+            .collect();
+
+        assert_eq!(repaired, "\u{AC00}\u{B098}\u{B2EC} \u{314F}");
     }
 
     #[test]

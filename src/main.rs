@@ -248,6 +248,7 @@ fn main() -> AureaResult<()> {
     let mut window_size = (config.window.width, config.window.height);
     let mut last_title: Option<String> = None;
     let mut scroll_offset: usize = 0;
+    let mut text_input = input::TextInputNormalizer::new();
     // Mouse text selection state.
     let mut sel_anchor: Option<(usize, usize)> = None; // (row, col) where drag started
     let mut sel_end: Option<(usize, usize)> = None; // (row, col) where drag is/ended
@@ -434,7 +435,8 @@ fn main() -> AureaResult<()> {
                     }
                 }
                 WindowEvent::TextInput { text } => {
-                    let printable: String = input::normalize_text_input(text)
+                    let printable: String = text_input
+                        .normalize(text)
                         .chars()
                         .filter(|c| !c.is_control())
                         .collect();
