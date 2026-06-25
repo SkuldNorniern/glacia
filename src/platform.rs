@@ -63,15 +63,49 @@ fn which_exe(name: &str) -> bool {
 /// sourcing `/etc/profile`, `~/.zprofile`, `~/.bash_profile`, etc.
 /// Without this, GUI-launched apps inherit a bare system PATH that omits
 /// Homebrew, pyenv, cargo, and any other user-installed tool directories.
-pub fn shell_args() -> Vec<OsString> {
+pub fn shell_args(shell: &str) -> Vec<OsString> {
+    #[cfg(windows)]
+    {
+        let name = shell
+            .rsplit(['\\', '/'])
+            .next()
+            .unwrap_or(shell)
+            .to_ascii_lowercase();
+        if name.starts_with("pwsh") || name.starts_with("powershell") {
+            return vec![
+                OsString::from("-NoLogo"),
+                OsString::from("-NoExit"),
+                OsString::from("-Command"),
+                OsString::from(
+                    "[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false); \
+                     [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); \
+                     $OutputEncoding = [Console]::OutputEncoding; \
+                     chcp.com 65001 > $null",
+                ),
+            ];
+        }
+        if name.starts_with("cmd") {
+            return vec![OsString::from("/K"), OsString::from("chcp 65001 > nul")];
+        }
+    }
     #[cfg(unix)]
     {
+        let _ = shell;
         vec![OsString::from("-l")]
     }
     #[cfg(not(unix))]
     {
+        let _ = shell;
         vec![]
     }
+}
+
+pub fn terminal_env() -> Vec<(OsString, OsString)> {
+    vec![
+        (OsString::from("LANG"), OsString::from("en_US.UTF-8")),
+        (OsString::from("LC_CTYPE"), OsString::from("en_US.UTF-8")),
+        (OsString::from("PYTHONUTF8"), OsString::from("1")),
+    ]
 }
 
 /// Safe built-in primary monospace font for this platform.

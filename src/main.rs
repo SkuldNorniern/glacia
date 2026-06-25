@@ -226,7 +226,8 @@ fn main() -> AureaResult<()> {
         cols,
         rows,
         shell: &resolved_shell,
-        args: platform::shell_args(),
+        args: platform::shell_args(&resolved_shell),
+        env: platform::terminal_env(),
         working_directory: &config.terminal.working_directory,
     }) {
         Ok(term) => term,
