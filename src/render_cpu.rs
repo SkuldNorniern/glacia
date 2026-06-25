@@ -1,7 +1,8 @@
 //! CPU drawing of the terminal grid. Concrete implementation, no renderer
 //! trait — see `PLAN.md`'s "UI Layering" note on when that's introduced.
 
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::HashMap;
 
 use aurea::AureaResult;
 use aurea::render::{
@@ -72,17 +73,20 @@ pub struct RowFonts {
     bold: Font,
     italic: Font,
     bold_italic: Font,
-    pub fallback: Option<Font>,
-    bold_fallback: Option<Font>,
-    italic_fallback: Option<Font>,
-    bold_italic_fallback: Option<Font>,
-    /// Codepoints detected at startup as missing from the primary font.
-    /// Populated by [`RowFonts::probe`]; only used when a fallback is configured.
-    probed_fallback: HashSet<u32>,
+    fallbacks: Vec<FontSet>,
+    support_cache: RefCell<HashMap<(usize, u32), bool>>,
+    notdef_cache: RefCell<HashMap<usize, Option<f32>>>,
+}
+
+struct FontSet {
+    regular: Font,
+    bold: Font,
+    italic: Font,
+    bold_italic: Font,
 }
 
 impl RowFonts {
-    pub fn new(primary: Font, fallback: Option<Font>) -> Self {
+    pub fn new(primary: Font, fallbacks: Vec<Font>) -> Self {
         let bold = Font {
             weight: FontWeight::Bold,
             ..primary.clone()
@@ -96,119 +100,159 @@ impl RowFonts {
             style: FontStyle::Italic,
             ..primary.clone()
         };
-        let bold_fallback = fallback.as_ref().map(|f| Font {
-            weight: FontWeight::Bold,
-            ..f.clone()
-        });
-        let italic_fallback = fallback.as_ref().map(|f| Font {
-            style: FontStyle::Italic,
-            ..f.clone()
-        });
-        let bold_italic_fallback = fallback.as_ref().map(|f| Font {
-            weight: FontWeight::Bold,
-            style: FontStyle::Italic,
-            ..f.clone()
-        });
+        let fallbacks = fallbacks
+            .into_iter()
+            .map(|regular| FontSet {
+                bold: Font {
+                    weight: FontWeight::Bold,
+                    ..regular.clone()
+                },
+                italic: Font {
+                    style: FontStyle::Italic,
+                    ..regular.clone()
+                },
+                bold_italic: Font {
+                    weight: FontWeight::Bold,
+                    style: FontStyle::Italic,
+                    ..regular.clone()
+                },
+                regular,
+            })
+            .collect();
         Self {
             primary,
             bold,
             italic,
             bold_italic,
-            fallback,
-            bold_fallback,
-            italic_fallback,
-            bold_italic_fallback,
-            probed_fallback: HashSet::new(),
+            fallbacks,
+            support_cache: RefCell::new(HashMap::new()),
+            notdef_cache: RefCell::new(HashMap::new()),
         }
     }
 
-    /// Measure a sample of characters with the primary font and record those
-    /// whose advance matches the `.notdef` sentinel (U+FFFE), indicating the
-    /// primary font has no glyph for them. Only meaningful when a fallback font
-    /// is configured; safe to call with no fallback (becomes a no-op).
-    pub fn probe(&mut self, ctx: &mut dyn DrawingContext, cell_width: f32) {
-        if self.fallback.is_none() {
-            return;
+    /// Prime glyph-support caches for common terminal and multilingual text.
+    /// Any character not listed here is still resolved lazily during drawing.
+    pub fn probe(&mut self, ctx: &mut dyn DrawingContext, _cell_width: f32) {
+        for ch in [
+            '\u{2500}',
+            '\u{2502}',
+            '\u{250C}',
+            '\u{2510}',
+            '\u{2514}',
+            '\u{2518}',
+            '\u{2588}',
+            '\u{2591}',
+            '\u{28FF}',
+            '\u{2713}',
+            '\u{03BB}',
+            '\u{D55C}',
+            '\u{AE00}',
+            '\u{8A9E}',
+            '\u{3042}',
+            '\u{1F642}',
+        ] {
+            let _ = self.font_slot_for_chars(ctx, [ch]);
         }
+    }
 
-        // U+FFFE is a guaranteed non-character — every font maps it to .notdef.
-        // Its advance becomes our reference for "font has no glyph here".
-        let notdef_advance = ctx
-            .measure_text("\u{FFFE}", &self.primary)
-            .map(|m| m.advance)
-            .unwrap_or(0.0);
-
-        // Only meaningful if .notdef has a distinct advance we can compare against.
-        // If notdef_advance == 0 the font face reports nothing — skip probing.
-        if notdef_advance < 0.1 {
-            return;
-        }
-
-        let probes: &[char] = &[
-            // Box Drawing (U+2500-U+257F) — heavily used by htop, vim, tmux, etc.
-            '─', '│', '┌', '┐', '└', '┘', '├', '┤', '┬', '┴', '┼', '╔', '╗', '╚', '╝', '║', '═',
-            '╠', '╣', '╦', '╩', '╬',
-            // Block Elements (U+2580-U+259F) — progress bars, borders, fills
-            '▀', '▄', '█', '▌', '▐', '░', '▒', '▓',
-            // Braille Patterns (U+2800-U+28FF) — common in terminal UIs
-            '⠀', '⠋', '⠿', // Miscellaneous Symbols (U+2600-U+26FF)
-            '☀', '☁', '★', '☆', '☑', '☒', '♥', '♦', // Dingbats (U+2700-U+27BF)
-            '✓', '✗', '✦', '✧', '➔', '➜',
-            // Supplemental Arrows-B / Misc Math (U+27C0-U+27EF)
-            '⟹', '⟺', // Miscellaneous Technical (U+2300-U+23FF)
-            '⌨', '⌚', '⌛', '⏎', '⏳', // Mathematical Operators (U+2200-U+22FF)
-            '∀', '∂', '∑', '∞', '∇', '∈', '∉', '≈', '≠', '≤', '≥',
-            // Geometric Shapes (U+25A0-U+25FF)
-            '◆', '◇', '◈', '▲', '▼', '◀', '▶',
-            // Number Forms / Letterlike (U+2100-U+214F)
-            '™', '©', '®', '℃', '℉',
-            // Enclosed Alphanumerics (U+2460-U+24FF) — circled numbers/letters
-            '①', '②', '③', '⑩', 'Ⓐ',
-        ];
-
-        // Tolerance: glyphs whose advance is within 1px of notdef are considered missing.
-        let tol = 1.0_f32;
-        // Also treat glyphs much narrower than the cell width as substituted .notdef.
-        let narrow_threshold = cell_width * 0.4;
-
-        for &ch in probes {
-            let Ok(m) = ctx.measure_text(&ch.to_string(), &self.primary) else {
-                continue;
+    fn pick(&self, bold: bool, italic: bool, slot: usize) -> &Font {
+        if slot == 0 {
+            return match (bold, italic) {
+                (true, true) => &self.bold_italic,
+                (false, true) => &self.italic,
+                (true, false) => &self.bold,
+                (false, false) => &self.primary,
             };
-            if (m.advance - notdef_advance).abs() <= tol || m.advance < narrow_threshold {
-                self.probed_fallback.insert(ch as u32);
+        }
+        let set = &self.fallbacks[slot - 1];
+        match (bold, italic) {
+            (true, true) => &set.bold_italic,
+            (false, true) => &set.italic,
+            (true, false) => &set.bold,
+            (false, false) => &set.regular,
+        }
+    }
+
+    fn font_slot_for_cell(&self, ctx: &mut dyn DrawingContext, cell: &Cell) -> usize {
+        match &cell.kind {
+            CellKind::Char(c) => self.font_slot_for_chars(ctx, [*c]),
+            CellKind::Cluster(s) => self.font_slot_for_chars(ctx, s.chars()),
+            _ => 0,
+        }
+    }
+
+    fn font_slot_for_chars<I>(&self, ctx: &mut dyn DrawingContext, chars: I) -> usize
+    where
+        I: IntoIterator<Item = char> + Clone,
+    {
+        for slot in 0..=self.fallbacks.len() {
+            if chars
+                .clone()
+                .into_iter()
+                .filter(|c| !c.is_control() && !is_variation_selector(*c))
+                .all(|c| self.font_supports(ctx, slot, c))
+            {
+                return slot;
             }
         }
+        0
     }
 
-    fn pick(&self, bold: bool, italic: bool, use_fallback: bool) -> &Font {
-        match (bold, italic, use_fallback) {
-            (true, true, true) => self
-                .bold_italic_fallback
-                .as_ref()
-                .unwrap_or(&self.bold_italic),
-            (true, true, false) => &self.bold_italic,
-            (false, true, true) => self.italic_fallback.as_ref().unwrap_or(&self.italic),
-            (false, true, false) => &self.italic,
-            (true, false, true) => self.bold_fallback.as_ref().unwrap_or(&self.bold),
-            (true, false, false) => &self.bold,
-            (false, false, true) => self.fallback.as_ref().unwrap_or(&self.primary),
-            (false, false, false) => &self.primary,
+    fn font_supports(&self, ctx: &mut dyn DrawingContext, slot: usize, ch: char) -> bool {
+        if ch.is_ascii() {
+            return true;
+        }
+        let key = (slot, ch as u32);
+        if let Some(supported) = self.support_cache.borrow().get(&key) {
+            return *supported;
+        }
+
+        let supported = self.measure_support(ctx, slot, ch);
+        self.support_cache.borrow_mut().insert(key, supported);
+        supported
+    }
+
+    fn measure_support(&self, ctx: &mut dyn DrawingContext, slot: usize, ch: char) -> bool {
+        let Some(notdef_advance) = self.notdef_advance(ctx, slot) else {
+            return true;
+        };
+        let text = ch.to_string();
+        let Ok(metrics) = ctx.measure_text(&text, self.regular_font(slot)) else {
+            return false;
+        };
+        metrics.advance > 0.1 && (metrics.advance - notdef_advance).abs() > 0.5
+    }
+
+    fn notdef_advance(&self, ctx: &mut dyn DrawingContext, slot: usize) -> Option<f32> {
+        if let Some(advance) = self.notdef_cache.borrow().get(&slot) {
+            return *advance;
+        }
+        let advance = ctx
+            .measure_text("\u{FFFE}", self.regular_font(slot))
+            .ok()
+            .map(|metrics| metrics.advance)
+            .filter(|advance| *advance > 0.1);
+        self.notdef_cache.borrow_mut().insert(slot, advance);
+        advance
+    }
+
+    fn regular_font(&self, slot: usize) -> &Font {
+        if slot == 0 {
+            &self.primary
+        } else {
+            &self.fallbacks[slot - 1].regular
         }
     }
+}
 
-    /// Whether a character should be rendered with the fallback font rather
-    /// than the primary. Combines a static Unicode-range check for common
-    /// blocks Western monospace fonts lack (CJK, Hangul, emoji, braille, …)
-    /// with the startup probe results from [`RowFonts::probe`].
-    pub fn char_needs_fallback(&self, c: char) -> bool {
-        static_needs_fallback(c) || self.probed_fallback.contains(&(c as u32))
-    }
+fn is_variation_selector(c: char) -> bool {
+    matches!(c as u32, 0xFE00..=0xFE0F | 0xE0100..=0xE01EF)
 }
 
 /// Static Unicode ranges that are rarely present in Western monospace fonts.
 /// Checked on every character; the probe set supplements this for less obvious
 /// gaps specific to the user's chosen primary font.
+#[allow(dead_code)]
 fn static_needs_fallback(c: char) -> bool {
     let n = c as u32;
     matches!(
@@ -292,16 +336,6 @@ fn push_cell_text(text: &mut String, cell: &Cell) {
     }
 }
 
-/// Whether a cell's content should use the fallback font, consulting both the
-/// static Unicode-range table and the startup probe results.
-fn cell_needs_fallback(cell: &Cell, fonts: &RowFonts) -> bool {
-    match &cell.kind {
-        CellKind::Char(c) => fonts.char_needs_fallback(*c),
-        CellKind::Cluster(s) => s.chars().any(|c| fonts.char_needs_fallback(c)),
-        _ => false,
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn draw_row(
     ctx: &mut dyn DrawingContext,
@@ -363,14 +397,14 @@ fn draw_row(
         let (fg, _) = resolve_pair(&row[i]);
         let bold = row[i].attrs.contains(Attrs::BOLD);
         let italic = row[i].attrs.contains(Attrs::ITALIC);
-        let use_fallback = cell_needs_fallback(&row[i], fonts);
+        let font_slot = fonts.font_slot_for_cell(ctx, &row[i]);
         let start = i;
         let mut text = String::new();
         while i < row.len()
             && resolve_pair(&row[i]).0 == fg
             && row[i].attrs.contains(Attrs::BOLD) == bold
             && row[i].attrs.contains(Attrs::ITALIC) == italic
-            && cell_needs_fallback(&row[i], fonts) == use_fallback
+            && fonts.font_slot_for_cell(ctx, &row[i]) == font_slot
             && !matches!(row[i].kind, CellKind::Continuation)
         {
             push_cell_text(&mut text, &row[i]);
@@ -385,7 +419,7 @@ fn draw_row(
         ctx.draw_text_with_font(
             &text,
             Point::new(x, baseline.round()),
-            fonts.pick(bold, italic, use_fallback),
+            fonts.pick(bold, italic, font_slot),
             &solid(fg),
         )?;
     }
@@ -461,12 +495,12 @@ pub fn draw_grid(
                         if !text.trim().is_empty() {
                             let bold = cell.attrs.contains(Attrs::BOLD);
                             let italic = cell.attrs.contains(Attrs::ITALIC);
-                            let use_fallback = cell_needs_fallback(cell, fonts);
+                            let font_slot = fonts.font_slot_for_cell(ctx, cell);
                             let char_color = theme::resolve(cell.bg, theme::BACKGROUND);
                             ctx.draw_text_with_font(
                                 &text,
                                 Point::new(x.round(), (y + metrics.baseline_offset).round()),
-                                fonts.pick(bold, italic, use_fallback),
+                                fonts.pick(bold, italic, font_slot),
                                 &solid(char_color),
                             )?;
                         }

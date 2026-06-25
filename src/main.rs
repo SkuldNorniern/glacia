@@ -196,14 +196,21 @@ fn main() -> AureaResult<()> {
     // Build fonts once. RowFonts owns the bold variants so they are not
     // re-cloned on every frame.
     let primary_font = Font::new(&config.font.family, config.font.size);
-    let fallback_font = if config.font.fallback.is_empty() {
-        None
-    } else {
-        Some(Font::new(&config.font.fallback, config.font.size))
-    };
+    let mut fallback_families = config.font.fallbacks.clone();
+    fallback_families.extend(
+        platform::default_fallback_fonts()
+            .iter()
+            .map(|family| (*family).to_owned()),
+    );
+    fallback_families.dedup();
+    fallback_families.retain(|family| family != &config.font.family);
+    let fallback_fonts = fallback_families
+        .iter()
+        .map(|family| Font::new(family, config.font.size))
+        .collect();
     // Build RowFonts first so cell_metrics can probe font support in the same
     // canvas draw call that measures the cell width.
-    let mut row_fonts = RowFonts::new(primary_font, fallback_font);
+    let mut row_fonts = RowFonts::new(primary_font, fallback_fonts);
     let metrics = cell_metrics(&config, &canvas_arc, &mut row_fonts);
 
     // Prefer PowerShell on Windows when the user hasn't set an explicit shell.
