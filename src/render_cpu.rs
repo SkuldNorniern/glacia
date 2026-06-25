@@ -186,7 +186,7 @@ impl RowFonts {
         I: IntoIterator<Item = char> + Clone,
     {
         let start_slot =
-            if self.fallbacks.is_empty() || !chars.clone().into_iter().any(static_needs_fallback) {
+            if self.fallbacks.is_empty() || !chars.clone().into_iter().any(prefers_fallback_font) {
                 0
             } else {
                 1
@@ -223,7 +223,7 @@ impl RowFonts {
 
     fn measure_support(&self, ctx: &mut dyn DrawingContext, slot: usize, ch: char) -> bool {
         let Some(notdef_advance) = self.notdef_advance(ctx, slot) else {
-            return true;
+            return slot == 0 && !static_needs_fallback(ch);
         };
         let text = ch.to_string();
         let Ok(metrics) = ctx.measure_text(&text, self.regular_font(slot)) else {
@@ -270,6 +270,16 @@ fn static_needs_fallback(c: char) -> bool {
     matches!(
         n,
         0x1100..=0x11FF     // Hangul Jamo
+        | 0x2100..=0x214F   // Letterlike Symbols
+        | 0x2200..=0x22FF   // Mathematical Operators
+        | 0x2300..=0x23FF   // Miscellaneous Technical
+        | 0x2460..=0x24FF   // Enclosed Alphanumerics
+        | 0x2500..=0x257F   // Box Drawing
+        | 0x2580..=0x259F   // Block Elements
+        | 0x25A0..=0x25FF   // Geometric Shapes
+        | 0x2600..=0x26FF   // Miscellaneous Symbols
+        | 0x2700..=0x27BF   // Dingbats
+        | 0x27C0..=0x27EF   // Supplemental Arrows-B / math
         | 0x2800..=0x28FF   // Braille Patterns
         | 0x2E80..=0x303F   // CJK Radicals, Kangxi, Symbols & Punctuation
         | 0x3040..=0x9FFF   // Kana, Bopomofo, CJK unified block
@@ -291,6 +301,32 @@ fn static_needs_fallback(c: char) -> bool {
         | 0x2A700..=0x2CEAF // CJK Extension C / D / E
         | 0x2CEB0..=0x2EBEF // CJK Extension F
         | 0x30000..=0x3134F // CJK Extension G
+    )
+}
+
+fn prefers_fallback_font(c: char) -> bool {
+    let n = c as u32;
+    matches!(
+        n,
+        0x1100..=0x11FF
+            | 0x2E80..=0x303F
+            | 0x3040..=0x9FFF
+            | 0xA000..=0xA4CF
+            | 0xA960..=0xA97F
+            | 0xAC00..=0xD7FF
+            | 0xF900..=0xFAFF
+            | 0xFE30..=0xFE4F
+            | 0xFF00..=0xFFEF
+            | 0x1B000..=0x1B1FF
+            | 0x1F000..=0x1F02F
+            | 0x1F0A0..=0x1F0FF
+            | 0x1F200..=0x1F2FF
+            | 0x1F300..=0x1FAFF
+            | 0x1FB00..=0x1FBFF
+            | 0x20000..=0x2A6DF
+            | 0x2A700..=0x2CEAF
+            | 0x2CEB0..=0x2EBEF
+            | 0x30000..=0x3134F
     )
 }
 
