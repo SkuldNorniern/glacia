@@ -144,8 +144,11 @@ pub fn default_fallback_fonts() -> &'static [&'static str] {
         &[
             "SF Mono",
             "Apple SD Gothic Neo",
+            "AppleGothic",
             "Hiragino Sans",
             "PingFang SC",
+            "Noto Sans CJK KR",
+            "Noto Sans Mono CJK KR",
             "Apple Symbols",
             "Apple Color Emoji",
         ]

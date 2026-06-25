@@ -8,6 +8,8 @@ use aurea::{KeyCode, Modifiers};
 #[cfg(windows)]
 use std::ptr::null_mut;
 
+use crate::unicode::compose_hangul_jamo;
+
 #[cfg(windows)]
 const MB_ERR_INVALID_CHARS: u32 = 0x0000_0008;
 #[cfg(windows)]
@@ -60,7 +62,7 @@ impl TextInputNormalizer {
         }
         #[cfg(not(windows))]
         {
-            text.to_owned()
+            compose_hangul_jamo(text)
         }
     }
 }
@@ -121,7 +123,7 @@ pub fn normalize_text_input(text: &str) -> String {
     }
     #[cfg(not(windows))]
     {
-        text.to_owned()
+        compose_hangul_jamo(text)
     }
 }
 
@@ -161,7 +163,7 @@ fn normalize_windows_text_input(pending: &mut Vec<u8>, text: &str) -> String {
         }
     }
 
-    out
+    compose_hangul_jamo(&out)
 }
 
 #[cfg(all(windows, test))]
@@ -521,5 +523,14 @@ mod tests {
     fn leaves_valid_text_input_unchanged() {
         assert_eq!(normalize_text_input("abc"), "abc");
         assert_eq!(normalize_text_input("\u{AC00}\u{B098}"), "\u{AC00}\u{B098}");
+    }
+
+    #[test]
+    fn composes_hangul_jamo_text_input() {
+        let mut normalizer = TextInputNormalizer::new();
+        assert_eq!(
+            normalizer.normalize("\u{1100}\u{1161}\u{1102}\u{1161}"),
+            "\u{AC00}\u{B098}"
+        );
     }
 }

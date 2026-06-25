@@ -11,6 +11,7 @@ mod plugin;
 mod render_cpu;
 mod terminal;
 mod theme;
+mod unicode;
 
 use std::sync::{Arc, Mutex};
 use std::thread::sleep;
