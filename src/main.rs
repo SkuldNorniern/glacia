@@ -434,7 +434,10 @@ fn main() -> AureaResult<()> {
                     }
                 }
                 WindowEvent::TextInput { text } => {
-                    let printable: String = text.chars().filter(|c| !c.is_control()).collect();
+                    let printable: String = input::normalize_text_input(text)
+                        .chars()
+                        .filter(|c| !c.is_control())
+                        .collect();
                     if !printable.is_empty() {
                         scroll_offset = 0;
                         sel_anchor = None;
