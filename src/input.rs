@@ -9,12 +9,17 @@ use aurea::{KeyCode, Modifiers};
 use std::ptr::null_mut;
 
 #[cfg(windows)]
-const CP949: u32 = 949;
-#[cfg(windows)]
 const MB_ERR_INVALID_CHARS: u32 = 0x0000_0008;
+#[cfg(windows)]
+const LOCALE_IDEFAULTANSICODEPAGE: u32 = 0x0000_1004;
+#[cfg(windows)]
+const COMMON_TEXT_INPUT_CODEPAGES: &[u32] = &[932, 936, 949, 950, 874, 1251, 1253, 1255, 1256];
 
 #[cfg(windows)]
 unsafe extern "system" {
+    fn GetACP() -> u32;
+    fn GetKeyboardLayout(id_thread: u32) -> isize;
+    fn GetLocaleInfoW(locale: u32, lc_type: u32, data: *mut u16, data_len: i32) -> i32;
     fn MultiByteToWideChar(
         code_page: u32,
         flags: u32,
@@ -88,7 +93,7 @@ fn ctrl_sequence(key: KeyCode, shift: bool) -> Option<&'static str> {
 pub fn normalize_text_input(text: &str) -> String {
     #[cfg(windows)]
     {
-        repair_cp949_mojibake(text).unwrap_or_else(|| text.to_owned())
+        repair_windows_ansi_mojibake(text).unwrap_or_else(|| text.to_owned())
     }
     #[cfg(not(windows))]
     {
@@ -97,8 +102,8 @@ pub fn normalize_text_input(text: &str) -> String {
 }
 
 #[cfg(windows)]
-fn repair_cp949_mojibake(text: &str) -> Option<String> {
-    if text.chars().any(is_hangul) {
+fn repair_windows_ansi_mojibake(text: &str) -> Option<String> {
+    if text.chars().any(is_strong_script_char) {
         return None;
     }
 
@@ -116,16 +121,70 @@ fn repair_cp949_mojibake(text: &str) -> Option<String> {
         return None;
     }
 
-    let decoded = decode_cp949(&bytes)?;
-    decoded.chars().any(is_hangul).then_some(decoded)
+    for code_page in candidate_ansi_code_pages() {
+        let Some(decoded) = decode_code_page(code_page, &bytes) else {
+            continue;
+        };
+        if decoded != text && decoded_is_plausible(code_page, &decoded) {
+            return Some(decoded);
+        }
+    }
+    None
 }
 
 #[cfg(windows)]
-fn decode_cp949(bytes: &[u8]) -> Option<String> {
+fn candidate_ansi_code_pages() -> Vec<u32> {
+    let mut pages = Vec::new();
+    if let Some(page) = keyboard_layout_ansi_code_page() {
+        push_unique(&mut pages, page);
+    }
+    push_unique(&mut pages, unsafe { GetACP() });
+    for &page in COMMON_TEXT_INPUT_CODEPAGES {
+        push_unique(&mut pages, page);
+    }
+    pages
+}
+
+#[cfg(windows)]
+fn keyboard_layout_ansi_code_page() -> Option<u32> {
+    let hkl = unsafe { GetKeyboardLayout(0) };
+    let lang_id = (hkl as usize & 0xFFFF) as u32;
+    if lang_id == 0 {
+        return None;
+    }
+
+    let mut buf = [0u16; 16];
+    let len = unsafe {
+        GetLocaleInfoW(
+            lang_id,
+            LOCALE_IDEFAULTANSICODEPAGE,
+            buf.as_mut_ptr(),
+            buf.len() as i32,
+        )
+    };
+    if len <= 1 {
+        return None;
+    }
+
+    String::from_utf16(&buf[..(len as usize - 1)])
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|page| *page != 0 && *page != 65001)
+}
+
+#[cfg(windows)]
+fn push_unique(pages: &mut Vec<u32>, page: u32) {
+    if page != 0 && page != 65001 && !pages.contains(&page) {
+        pages.push(page);
+    }
+}
+
+#[cfg(windows)]
+fn decode_code_page(code_page: u32, bytes: &[u8]) -> Option<String> {
     let len = i32::try_from(bytes.len()).ok()?;
     let needed = unsafe {
         MultiByteToWideChar(
-            CP949,
+            code_page,
             MB_ERR_INVALID_CHARS,
             bytes.as_ptr(),
             len,
@@ -140,7 +199,7 @@ fn decode_cp949(bytes: &[u8]) -> Option<String> {
     let mut wide = vec![0u16; needed as usize];
     let written = unsafe {
         MultiByteToWideChar(
-            CP949,
+            code_page,
             MB_ERR_INVALID_CHARS,
             bytes.as_ptr(),
             len,
@@ -155,8 +214,73 @@ fn decode_cp949(bytes: &[u8]) -> Option<String> {
 }
 
 #[cfg(windows)]
+fn decoded_is_plausible(code_page: u32, decoded: &str) -> bool {
+    match code_page {
+        932 => decoded.chars().any(|c| is_kana(c) || is_cjk(c)),
+        936 | 950 => decoded.chars().any(is_cjk),
+        949 => decoded.chars().any(is_hangul),
+        874 => decoded.chars().any(is_thai),
+        1251 => decoded.chars().any(is_cyrillic),
+        1253 => decoded.chars().any(is_greek),
+        1255 => decoded.chars().any(is_hebrew),
+        1256 => decoded.chars().any(is_arabic),
+        _ => decoded.chars().any(is_strong_script_char),
+    }
+}
+
+#[cfg(windows)]
+fn is_strong_script_char(c: char) -> bool {
+    is_hangul(c)
+        || is_kana(c)
+        || is_cjk(c)
+        || is_thai(c)
+        || is_cyrillic(c)
+        || is_greek(c)
+        || is_hebrew(c)
+        || is_arabic(c)
+}
+
+#[cfg(windows)]
 fn is_hangul(c: char) -> bool {
-    matches!(c as u32, 0xAC00..=0xD7A3 | 0x1100..=0x11FF | 0x3130..=0x318F)
+    matches!(c as u32, 0x1100..=0x11FF | 0x3130..=0x318F | 0xAC00..=0xD7A3)
+}
+
+#[cfg(windows)]
+fn is_kana(c: char) -> bool {
+    matches!(c as u32, 0x3040..=0x30FF | 0x31F0..=0x31FF | 0xFF66..=0xFF9F)
+}
+
+#[cfg(windows)]
+fn is_cjk(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF
+    )
+}
+
+#[cfg(windows)]
+fn is_thai(c: char) -> bool {
+    matches!(c as u32, 0x0E00..=0x0E7F)
+}
+
+#[cfg(windows)]
+fn is_cyrillic(c: char) -> bool {
+    matches!(c as u32, 0x0400..=0x052F)
+}
+
+#[cfg(windows)]
+fn is_greek(c: char) -> bool {
+    matches!(c as u32, 0x0370..=0x03FF)
+}
+
+#[cfg(windows)]
+fn is_hebrew(c: char) -> bool {
+    matches!(c as u32, 0x0590..=0x05FF)
+}
+
+#[cfg(windows)]
+fn is_arabic(c: char) -> bool {
+    matches!(c as u32, 0x0600..=0x06FF | 0x0750..=0x077F | 0x08A0..=0x08FF)
 }
 
 /// Alt+key → ESC-prefix sequences (meta / escape-prefix convention).
@@ -246,7 +370,7 @@ mod tests {
 
     #[test]
     #[cfg(windows)]
-    fn repairs_cp949_korean_text_input_mojibake() {
+    fn repairs_korean_ansi_text_input_mojibake() {
         let mojibake = "\u{00B0}\u{00A1}\u{00B3}\u{00AA}\u{00B4}\u{00D9}\u{00B6}\u{00F3}";
         assert_eq!(
             normalize_text_input(mojibake),
