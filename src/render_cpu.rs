@@ -185,11 +185,20 @@ impl RowFonts {
     where
         I: IntoIterator<Item = char> + Clone,
     {
-        for slot in 0..=self.fallbacks.len() {
+        let start_slot =
+            if self.fallbacks.is_empty() || !chars.clone().into_iter().any(static_needs_fallback) {
+                0
+            } else {
+                1
+            };
+
+        for slot in start_slot..=self.fallbacks.len() {
             if chars
                 .clone()
                 .into_iter()
-                .filter(|c| !c.is_control() && !is_variation_selector(*c))
+                .filter(|c| {
+                    !c.is_control() && !is_zero_width_joiner(*c) && !is_variation_selector(*c)
+                })
                 .all(|c| self.font_supports(ctx, slot, c))
             {
                 return slot;
@@ -249,10 +258,13 @@ fn is_variation_selector(c: char) -> bool {
     matches!(c as u32, 0xFE00..=0xFE0F | 0xE0100..=0xE01EF)
 }
 
+fn is_zero_width_joiner(c: char) -> bool {
+    matches!(c as u32, 0x200C | 0x200D)
+}
+
 /// Static Unicode ranges that are rarely present in Western monospace fonts.
 /// Checked on every character; the probe set supplements this for less obvious
 /// gaps specific to the user's chosen primary font.
-#[allow(dead_code)]
 fn static_needs_fallback(c: char) -> bool {
     let n = c as u32;
     matches!(
@@ -336,6 +348,37 @@ fn push_cell_text(text: &mut String, cell: &Cell) {
     }
 }
 
+fn cell_uses_grid_origin(cell: &Cell) -> bool {
+    cell.width != 1
+        || matches!(cell.kind, CellKind::Cluster(_))
+        || matches!(cell.kind, CellKind::Char(c) if !c.is_ascii())
+}
+
+fn draw_cell_text(
+    ctx: &mut dyn DrawingContext,
+    cell: &Cell,
+    x: f32,
+    baseline: f32,
+    fonts: &RowFonts,
+    fg: Color,
+) -> AureaResult<()> {
+    let mut text = String::new();
+    push_cell_text(&mut text, cell);
+    if text.trim().is_empty() {
+        return Ok(());
+    }
+
+    let bold = cell.attrs.contains(Attrs::BOLD);
+    let italic = cell.attrs.contains(Attrs::ITALIC);
+    let font_slot = fonts.font_slot_for_cell(ctx, cell);
+    ctx.draw_text_with_font(
+        &text,
+        Point::new(x.round(), baseline.round()),
+        fonts.pick(bold, italic, font_slot),
+        &solid(fg),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_row(
     ctx: &mut dyn DrawingContext,
@@ -395,6 +438,13 @@ fn draw_row(
             continue;
         }
         let (fg, _) = resolve_pair(&row[i]);
+        if cell_uses_grid_origin(&row[i]) {
+            let x = (i as f32 * metrics.width + x_offset).round();
+            draw_cell_text(ctx, &row[i], x, baseline, fonts, fg)?;
+            i += 1;
+            continue;
+        }
+
         let bold = row[i].attrs.contains(Attrs::BOLD);
         let italic = row[i].attrs.contains(Attrs::ITALIC);
         let font_slot = fonts.font_slot_for_cell(ctx, &row[i]);
@@ -405,6 +455,7 @@ fn draw_row(
             && row[i].attrs.contains(Attrs::BOLD) == bold
             && row[i].attrs.contains(Attrs::ITALIC) == italic
             && fonts.font_slot_for_cell(ctx, &row[i]) == font_slot
+            && !cell_uses_grid_origin(&row[i])
             && !matches!(row[i].kind, CellKind::Continuation)
         {
             push_cell_text(&mut text, &row[i]);
