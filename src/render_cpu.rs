@@ -222,12 +222,15 @@ impl RowFonts {
     }
 
     fn measure_support(&self, ctx: &mut dyn DrawingContext, slot: usize, ch: char) -> bool {
-        let Some(notdef_advance) = self.notdef_advance(ctx, slot) else {
-            return slot == 0 && !static_needs_fallback(ch);
-        };
         let text = ch.to_string();
         let Ok(metrics) = ctx.measure_text(&text, self.regular_font(slot)) else {
             return false;
+        };
+        if slot > 0 && is_hangul_codepoint(ch) {
+            return metrics.advance > 0.1;
+        }
+        let Some(notdef_advance) = self.notdef_advance(ctx, slot) else {
+            return slot == 0 && !static_needs_fallback(ch);
         };
         metrics.advance > 0.1 && (metrics.advance - notdef_advance).abs() > 0.5
     }
@@ -260,6 +263,13 @@ fn is_variation_selector(c: char) -> bool {
 
 fn is_zero_width_joiner(c: char) -> bool {
     matches!(c as u32, 0x200C | 0x200D)
+}
+
+fn is_hangul_codepoint(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x1100..=0x11FF | 0x3130..=0x318F | 0xA960..=0xA97F | 0xAC00..=0xD7AF | 0xD7B0..=0xD7FF
+    )
 }
 
 /// Static Unicode ranges that are rarely present in Western monospace fonts.
@@ -388,6 +398,17 @@ fn cell_uses_grid_origin(cell: &Cell) -> bool {
     cell.width != 1
         || matches!(cell.kind, CellKind::Cluster(_))
         || matches!(cell.kind, CellKind::Char(c) if !c.is_ascii())
+}
+
+fn cursor_cell_span(row: &[Cell], col: usize) -> (usize, f32) {
+    if let Some(cell) = row.get(col) {
+        if matches!(cell.kind, CellKind::Continuation) && col > 0 {
+            let lead = &row[col - 1];
+            return (col - 1, f32::from(lead.width.max(1)));
+        }
+        return (col, f32::from(cell.width.max(1)));
+    }
+    (col, 1.0)
 }
 
 fn draw_cell_text(
@@ -567,16 +588,15 @@ pub fn draw_grid(
     if cursor_visible {
         let (row, col) = cursor;
         if row < rows.len() {
-            let x = col as f32 * metrics.width + padding;
+            let (cursor_col, cursor_width_cells) = cursor_cell_span(&rows[row], col);
+            let x = cursor_col as f32 * metrics.width + padding;
             let y = row as f32 * line_h + padding;
+            let cursor_width = metrics.width * cursor_width_cells;
             match cursor_shape {
                 CursorShape::Block => {
-                    ctx.draw_rect(
-                        Rect::new(x, y, metrics.width, line_h),
-                        &solid(theme::CURSOR),
-                    )?;
-                    if col < rows[row].len() {
-                        let cell = &rows[row][col];
+                    ctx.draw_rect(Rect::new(x, y, cursor_width, line_h), &solid(theme::CURSOR))?;
+                    if cursor_col < rows[row].len() {
+                        let cell = &rows[row][cursor_col];
                         let mut text = String::new();
                         push_cell_text(&mut text, cell);
                         if !text.trim().is_empty() {
@@ -598,7 +618,7 @@ pub fn draw_grid(
                 }
                 CursorShape::Underline => {
                     ctx.draw_rect(
-                        Rect::new(x, y + line_h - 2.0, metrics.width, 2.0),
+                        Rect::new(x, y + line_h - 2.0, cursor_width, 2.0),
                         &solid(theme::CURSOR),
                     )?;
                 }
