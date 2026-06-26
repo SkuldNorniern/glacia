@@ -142,13 +142,15 @@ pub fn default_fallback_fonts() -> &'static [&'static str] {
         ]
     } else if cfg!(target_os = "macos") {
         &[
-            "SF Mono",
+            "AppleSDGothicNeo",
             "Apple SD Gothic Neo",
             "AppleGothic",
+            "AppleMyungjo",
             "Hiragino Sans",
             "PingFang SC",
             "Noto Sans CJK KR",
             "Noto Sans Mono CJK KR",
+            "SF Mono",
             "Apple Symbols",
             "Apple Color Emoji",
         ]

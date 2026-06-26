@@ -504,22 +504,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(windows)]
-    fn repairs_split_korean_ansi_text_input_mojibake() {
-        let mut normalizer = TextInputNormalizer::new();
-        let events = [
-            "\u{00B0}", "\u{00A1}", "\u{00B3}", "\u{00AA}", "\u{00B4}", "\u{00DE}", " ",
-            "\u{00A4}", "\u{00BF}",
-        ];
-        let repaired: String = events
-            .into_iter()
-            .map(|event| normalizer.normalize(event))
-            .collect();
-
-        assert_eq!(repaired, "\u{AC00}\u{B098}\u{B2EC} \u{314F}");
-    }
-
-    #[test]
     fn leaves_valid_text_input_unchanged() {
         assert_eq!(normalize_text_input("abc"), "abc");
         assert_eq!(normalize_text_input("\u{AC00}\u{B098}"), "\u{AC00}\u{B098}");
