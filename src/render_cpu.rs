@@ -14,7 +14,6 @@ use vanta::{Cell, CellKind};
 
 use crate::config::CursorShape;
 use crate::theme;
-use crate::unicode::{compose_hangul_jamo, is_hangul_jamo};
 
 /// Normalized selection range in screen-cell coordinates.
 /// `start` is always ≤ `end` in row-major order after construction via [`SelectionRange::new`].
@@ -385,21 +384,6 @@ fn push_cell_text(text: &mut String, cell: &Cell) {
     }
 }
 
-fn composed_cell_text(cell: &Cell) -> String {
-    let mut text = String::new();
-    push_cell_text(&mut text, cell);
-    compose_hangul_jamo(&text)
-}
-
-fn cell_jamo_text(cell: &Cell) -> Option<String> {
-    if cell.attrs.contains(Attrs::HIDDEN) || matches!(cell.kind, CellKind::Continuation) {
-        return None;
-    }
-    let mut text = String::new();
-    push_cell_text(&mut text, cell);
-    (!text.is_empty() && text.chars().all(is_hangul_jamo)).then_some(text)
-}
-
 fn cell_uses_grid_origin(cell: &Cell) -> bool {
     cell.width != 1
         || matches!(cell.kind, CellKind::Cluster(_))
@@ -414,14 +398,15 @@ fn draw_cell_text(
     fonts: &RowFonts,
     fg: Color,
 ) -> AureaResult<()> {
-    let text = composed_cell_text(cell);
+    let mut text = String::new();
+    push_cell_text(&mut text, cell);
     if text.trim().is_empty() {
         return Ok(());
     }
 
     let bold = cell.attrs.contains(Attrs::BOLD);
     let italic = cell.attrs.contains(Attrs::ITALIC);
-    let font_slot = fonts.font_slot_for_chars(ctx, text.chars());
+    let font_slot = fonts.font_slot_for_cell(ctx, cell);
     ctx.draw_text_with_font(
         &text,
         Point::new(x.round(), baseline.round()),
@@ -489,44 +474,6 @@ fn draw_row(
             continue;
         }
         let (fg, _) = resolve_pair(&row[i]);
-        if let Some(mut raw) = cell_jamo_text(&row[i]) {
-            let bold = row[i].attrs.contains(Attrs::BOLD);
-            let italic = row[i].attrs.contains(Attrs::ITALIC);
-            let start = i;
-            i += 1;
-            while i < row.len() {
-                if matches!(row[i].kind, CellKind::Continuation) {
-                    i += 1;
-                    continue;
-                }
-                if resolve_pair(&row[i]).0 != fg
-                    || row[i].attrs.contains(Attrs::BOLD) != bold
-                    || row[i].attrs.contains(Attrs::ITALIC) != italic
-                {
-                    break;
-                }
-                let Some(text) = cell_jamo_text(&row[i]) else {
-                    break;
-                };
-                raw.push_str(&text);
-                i += 1;
-            }
-
-            let text = compose_hangul_jamo(&raw);
-            if text == raw {
-                i = start;
-            } else {
-                let x = (start as f32 * metrics.width + x_offset).round();
-                let font_slot = fonts.font_slot_for_chars(ctx, text.chars());
-                ctx.draw_text_with_font(
-                    &text,
-                    Point::new(x, baseline.round()),
-                    fonts.pick(bold, italic, font_slot),
-                    &solid(fg),
-                )?;
-                continue;
-            }
-        }
         if cell_uses_grid_origin(&row[i]) {
             let x = (i as f32 * metrics.width + x_offset).round();
             draw_cell_text(ctx, &row[i], x, baseline, fonts, fg)?;
@@ -550,7 +497,6 @@ fn draw_row(
             push_cell_text(&mut text, &row[i]);
             i += 1;
         }
-        let text = compose_hangul_jamo(&text);
         if text.trim_end().is_empty() {
             continue;
         }
@@ -631,11 +577,12 @@ pub fn draw_grid(
                     )?;
                     if col < rows[row].len() {
                         let cell = &rows[row][col];
-                        let text = composed_cell_text(cell);
+                        let mut text = String::new();
+                        push_cell_text(&mut text, cell);
                         if !text.trim().is_empty() {
                             let bold = cell.attrs.contains(Attrs::BOLD);
                             let italic = cell.attrs.contains(Attrs::ITALIC);
-                            let font_slot = fonts.font_slot_for_chars(ctx, text.chars());
+                            let font_slot = fonts.font_slot_for_cell(ctx, cell);
                             let char_color = theme::resolve(cell.bg, theme::BACKGROUND);
                             ctx.draw_text_with_font(
                                 &text,
