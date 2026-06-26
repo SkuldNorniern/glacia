@@ -338,6 +338,10 @@ fn main() -> AureaResult<()> {
                     } else if modifiers.ctrl && modifiers.shift && *key == KeyCode::V {
                         if let Some(text) = clipboard_text() {
                             scroll_offset = 0;
+                            let pending = text_input.flush();
+                            if !pending.is_empty() {
+                                let _ = term.write_str(&pending);
+                            }
                             if term.bracketed_paste_enabled() {
                                 let _ = term.write_str("\x1b[200~");
                                 let _ = term.write_str(&text);
@@ -359,6 +363,10 @@ fn main() -> AureaResult<()> {
                             _ => None,
                         };
                         if let Some(seq) = forwarded {
+                            let pending = text_input.flush();
+                            if !pending.is_empty() {
+                                let _ = term.write_str(&pending);
+                            }
                             let _ = term.write_str(seq);
                             cursor_visible = true;
                             last_blink = Instant::now();
@@ -366,6 +374,10 @@ fn main() -> AureaResult<()> {
                         } else if let Some(bytes) = input::terminal_key_bytes(*key, *modifiers) {
                             sel_anchor = None;
                             sel_end = None;
+                            let pending = text_input.flush();
+                            if !pending.is_empty() {
+                                let _ = term.write_str(&pending);
+                            }
                             let _ = term.write_str(&bytes);
                             cursor_visible = true;
                             last_blink = Instant::now();
@@ -407,6 +419,10 @@ fn main() -> AureaResult<()> {
                                     scroll_offset = 0;
                                     sel_anchor = None;
                                     sel_end = None;
+                                    let pending = text_input.flush();
+                                    if !pending.is_empty() {
+                                        let _ = term.write_str(&pending);
+                                    }
                                     let _ = term.write_str(&bytes);
                                     cursor_visible = true;
                                     last_blink = Instant::now();

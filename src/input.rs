@@ -9,6 +9,8 @@ use aurea::{KeyCode, Modifiers};
 use std::ptr::null_mut;
 
 use crate::unicode::compose_hangul_jamo;
+#[cfg(not(windows))]
+use crate::unicode::is_hangul_jamo;
 
 #[cfg(windows)]
 const MB_ERR_INVALID_CHARS: u32 = 0x0000_0008;
@@ -48,6 +50,8 @@ pub fn terminal_key_bytes(key: KeyCode, mods: Modifiers) -> Option<String> {
 pub struct TextInputNormalizer {
     #[cfg(windows)]
     pending_ansi: Vec<u8>,
+    #[cfg(not(windows))]
+    pending_jamo: String,
 }
 
 impl TextInputNormalizer {
@@ -62,7 +66,20 @@ impl TextInputNormalizer {
         }
         #[cfg(not(windows))]
         {
-            compose_hangul_jamo(text)
+            normalize_unix_text_input(&mut self.pending_jamo, text)
+        }
+    }
+
+    pub fn flush(&mut self) -> String {
+        #[cfg(windows)]
+        {
+            String::new()
+        }
+        #[cfg(not(windows))]
+        {
+            let out = compose_hangul_jamo(&self.pending_jamo);
+            self.pending_jamo.clear();
+            out
         }
     }
 }
@@ -125,6 +142,31 @@ pub fn normalize_text_input(text: &str) -> String {
     {
         compose_hangul_jamo(text)
     }
+}
+
+#[cfg(not(windows))]
+fn normalize_unix_text_input(pending_jamo: &mut String, text: &str) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+
+    if text.chars().all(is_hangul_jamo) {
+        pending_jamo.push_str(text);
+        let composed = compose_hangul_jamo(pending_jamo);
+        if composed != *pending_jamo {
+            pending_jamo.clear();
+            return composed;
+        }
+        return String::new();
+    }
+
+    let mut out = String::new();
+    if !pending_jamo.is_empty() {
+        out.push_str(&compose_hangul_jamo(pending_jamo));
+        pending_jamo.clear();
+    }
+    out.push_str(&compose_hangul_jamo(text));
+    out
 }
 
 #[cfg(windows)]
@@ -516,5 +558,23 @@ mod tests {
             normalizer.normalize("\u{1100}\u{1161}\u{1102}\u{1161}"),
             "\u{AC00}\u{B098}"
         );
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn buffers_split_hangul_jamo_text_input() {
+        let mut normalizer = TextInputNormalizer::new();
+        assert_eq!(normalizer.normalize("\u{1100}"), "");
+        assert_eq!(normalizer.normalize("\u{1161}"), "\u{AC00}");
+        assert_eq!(normalizer.normalize("\u{1102}"), "");
+        assert_eq!(normalizer.normalize("\u{1161}"), "\u{B098}");
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn flushes_pending_hangul_jamo_text_input() {
+        let mut normalizer = TextInputNormalizer::new();
+        assert_eq!(normalizer.normalize("\u{1100}"), "");
+        assert_eq!(normalizer.flush(), "\u{1100}");
     }
 }
