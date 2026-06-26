@@ -24,7 +24,7 @@ use aurea::{clipboard_text, set_clipboard_text};
 
 use canvas::{SendableCanvas, SharedCanvas, lock};
 use config::Config;
-use render_cpu::{CellMetrics, RowFonts, SelectionRange};
+use render_cpu::{CellMetrics, CellRowsView, RowFonts, SelectionRange};
 use terminal::{SpawnOverrides, TerminalSession};
 use vanta::{Cell, CellKind};
 
@@ -561,7 +561,7 @@ fn main() -> AureaResult<()> {
                 if scroll_offset == 0 {
                     render_cpu::draw_grid(
                         ctx,
-                        term.cells(),
+                        &CellRowsView::from_screen(term.cells()),
                         term.cursor(),
                         cursor_visible,
                         &metrics,
@@ -576,18 +576,9 @@ fn main() -> AureaResult<()> {
                     let total = sb.len() + screen.len();
                     let end = total.saturating_sub(scroll_offset);
                     let start = end.saturating_sub(visible_rows);
-                    let view: Vec<Vec<Cell>> = (start..end)
-                        .map(|i| {
-                            if i < sb.len() {
-                                sb[i].clone()
-                            } else {
-                                screen[i - sb.len()].clone()
-                            }
-                        })
-                        .collect();
                     render_cpu::draw_grid(
                         ctx,
-                        &view,
+                        &CellRowsView::from_split(sb, screen, start, end),
                         (usize::MAX, usize::MAX),
                         false,
                         &metrics,
