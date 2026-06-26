@@ -7,7 +7,10 @@ const V_COUNT: u32 = 21;
 const T_COUNT: u32 = 28;
 const N_COUNT: u32 = V_COUNT * T_COUNT;
 
-pub fn compose_hangul_jamo(text: &str) -> String {
+pub fn compose_hangul_jamo(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.chars().any(is_hangul_jamo) {
+        return std::borrow::Cow::Borrowed(text);
+    }
     let chars: Vec<char> = text.chars().collect();
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
@@ -44,7 +47,7 @@ pub fn compose_hangul_jamo(text: &str) -> String {
         }
     }
 
-    out
+    std::borrow::Cow::Owned(out)
 }
 
 pub fn is_hangul_jamo(c: char) -> bool {

@@ -77,7 +77,7 @@ impl TextInputNormalizer {
         }
         #[cfg(not(windows))]
         {
-            let out = compose_hangul_jamo(&self.pending_jamo);
+            let out = compose_hangul_jamo(&self.pending_jamo).into_owned();
             self.pending_jamo.clear();
             out
         }
@@ -140,7 +140,7 @@ pub fn normalize_text_input(text: &str) -> String {
     }
     #[cfg(not(windows))]
     {
-        compose_hangul_jamo(text)
+        compose_hangul_jamo(text).into_owned()
     }
 }
 
@@ -153,9 +153,9 @@ fn normalize_unix_text_input(pending_jamo: &mut String, text: &str) -> String {
     if text.chars().all(is_hangul_jamo) {
         pending_jamo.push_str(text);
         let composed = compose_hangul_jamo(pending_jamo);
-        if composed != *pending_jamo {
+        if composed != pending_jamo.as_str() {
             pending_jamo.clear();
-            return composed;
+            return composed.into_owned();
         }
         return String::new();
     }
@@ -205,7 +205,7 @@ fn normalize_windows_text_input(pending: &mut Vec<u8>, text: &str) -> String {
         }
     }
 
-    compose_hangul_jamo(&out)
+    compose_hangul_jamo(&out).into_owned()
 }
 
 #[cfg(all(windows, test))]

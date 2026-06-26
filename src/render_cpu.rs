@@ -16,6 +16,47 @@ use crate::config::CursorShape;
 use crate::theme;
 use crate::unicode::{compose_hangul_jamo, is_hangul_jamo};
 
+/// Zero-copy view over terminal grid rows, bridging the scrollback/screen split.
+///
+/// Avoids the `Vec<Vec<Cell>>` clone that would otherwise happen every rendered
+/// frame while the user is scrolled into scrollback history.
+pub struct CellRowsView<'a> {
+    sb: &'a [Vec<Cell>],
+    screen: &'a [Vec<Cell>],
+    start: usize,
+    len: usize,
+}
+
+impl<'a> CellRowsView<'a> {
+    /// View over the live screen only (scroll_offset == 0).
+    pub fn from_screen(screen: &'a [Vec<Cell>]) -> Self {
+        Self { sb: &[], screen, start: 0, len: screen.len() }
+    }
+
+    /// View over a window spanning both scrollback and screen (scroll_offset > 0).
+    pub fn from_split(
+        sb: &'a [Vec<Cell>],
+        screen: &'a [Vec<Cell>],
+        start: usize,
+        end: usize,
+    ) -> Self {
+        Self { sb, screen, start, len: end.saturating_sub(start) }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn get(&self, idx: usize) -> Option<&'a [Cell]> {
+        let i = self.start + idx;
+        if i < self.sb.len() {
+            Some(&self.sb[i])
+        } else {
+            self.screen.get(i - self.sb.len()).map(Vec::as_slice)
+        }
+    }
+}
+
 /// Normalized selection range in screen-cell coordinates.
 /// `start` is always ≤ `end` in row-major order after construction via [`SelectionRange::new`].
 #[derive(Clone, Copy)]
@@ -400,7 +441,7 @@ fn push_cell_text(text: &mut String, cell: &Cell) {
 fn composed_cell_text(cell: &Cell) -> String {
     let mut text = String::new();
     push_cell_text(&mut text, cell);
-    compose_hangul_jamo(&text)
+    compose_hangul_jamo(&text).into_owned()
 }
 
 fn cell_jamo_text(cell: &Cell) -> Option<String> {
@@ -562,6 +603,11 @@ fn draw_row(
         let font_slot = fonts.font_slot_for_cell(ctx, &row[i]);
         let start = i;
         let mut text = String::new();
+        // Push the first cell (already known to match — avoids a duplicate
+        // font_slot_for_cell call that would otherwise fire in the while condition
+        // for cell `start` before push_cell_text advances `i`).
+        push_cell_text(&mut text, &row[i]);
+        i += 1;
         while i < row.len()
             && resolve_pair(&row[i]).0 == fg
             && row[i].attrs.contains(Attrs::BOLD) == bold
@@ -615,7 +661,7 @@ fn draw_row(
 #[allow(clippy::too_many_arguments)]
 pub fn draw_grid(
     ctx: &mut dyn DrawingContext,
-    rows: &[Vec<Cell>],
+    rows: &CellRowsView<'_>,
     cursor: (usize, usize),
     cursor_visible: bool,
     metrics: &CellMetrics,
@@ -626,7 +672,8 @@ pub fn draw_grid(
 ) -> AureaResult<()> {
     let line_h = metrics.height;
 
-    for (row_idx, row) in rows.iter().enumerate() {
+    for row_idx in 0..rows.len() {
+        let Some(row) = rows.get(row_idx) else { continue };
         let y_top = row_idx as f32 * line_h + padding;
         let sel_cols = selection.and_then(|s| s.cols_for_row(row_idx, row.len()));
         draw_row(
@@ -644,38 +691,39 @@ pub fn draw_grid(
     if cursor_visible {
         let (row, col) = cursor;
         if row < rows.len() {
-            let (cursor_col, cursor_width_cells) = cursor_cell_span(&rows[row], col);
-            let x = cursor_col as f32 * metrics.width + padding;
-            let y = row as f32 * line_h + padding;
-            let cursor_width = metrics.width * cursor_width_cells;
-            match cursor_shape {
-                CursorShape::Block => {
-                    ctx.draw_rect(Rect::new(x, y, cursor_width, line_h), &solid(theme::CURSOR))?;
-                    if cursor_col < rows[row].len() {
-                        let cell = &rows[row][cursor_col];
-                        let text = composed_cell_text(cell);
-                        if !text.trim().is_empty() {
-                            let bold = cell.attrs.contains(Attrs::BOLD);
-                            let italic = cell.attrs.contains(Attrs::ITALIC);
-                            let font_slot = fonts.font_slot_for_chars(ctx, text.chars());
-                            let char_color = theme::resolve(cell.bg, theme::BACKGROUND);
-                            ctx.draw_text_with_font(
-                                &text,
-                                Point::new(x.round(), (y + metrics.baseline_offset).round()),
-                                fonts.pick(bold, italic, font_slot),
-                                &solid(char_color),
-                            )?;
+            if let Some(cursor_row) = rows.get(row) {
+                let (cursor_col, cursor_width_cells) = cursor_cell_span(cursor_row, col);
+                let x = cursor_col as f32 * metrics.width + padding;
+                let y = row as f32 * line_h + padding;
+                let cursor_width = metrics.width * cursor_width_cells;
+                match cursor_shape {
+                    CursorShape::Block => {
+                        ctx.draw_rect(Rect::new(x, y, cursor_width, line_h), &solid(theme::CURSOR))?;
+                        if let Some(cell) = cursor_row.get(cursor_col) {
+                            let text = composed_cell_text(cell);
+                            if !text.trim().is_empty() {
+                                let bold = cell.attrs.contains(Attrs::BOLD);
+                                let italic = cell.attrs.contains(Attrs::ITALIC);
+                                let font_slot = fonts.font_slot_for_chars(ctx, text.chars());
+                                let char_color = theme::resolve(cell.bg, theme::BACKGROUND);
+                                ctx.draw_text_with_font(
+                                    &text,
+                                    Point::new(x.round(), (y + metrics.baseline_offset).round()),
+                                    fonts.pick(bold, italic, font_slot),
+                                    &solid(char_color),
+                                )?;
+                            }
                         }
                     }
-                }
-                CursorShape::Beam => {
-                    ctx.draw_rect(Rect::new(x, y, 2.0, line_h), &solid(theme::CURSOR))?;
-                }
-                CursorShape::Underline => {
-                    ctx.draw_rect(
-                        Rect::new(x, y + line_h - 2.0, cursor_width, 2.0),
-                        &solid(theme::CURSOR),
-                    )?;
+                    CursorShape::Beam => {
+                        ctx.draw_rect(Rect::new(x, y, 2.0, line_h), &solid(theme::CURSOR))?;
+                    }
+                    CursorShape::Underline => {
+                        ctx.draw_rect(
+                            Rect::new(x, y + line_h - 2.0, cursor_width, 2.0),
+                            &solid(theme::CURSOR),
+                        )?;
+                    }
                 }
             }
         }
