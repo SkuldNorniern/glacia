@@ -171,6 +171,37 @@ fn main() -> AureaResult<()> {
         .unwrap_or_default();
     let _ = plugins; // available for the oxygen scripting engine when wired in
 
+    // Prefer PowerShell on Windows when the user hasn't set an explicit shell.
+    let resolved_shell = if config.terminal.shell.is_empty() {
+        platform::preferred_shell().unwrap_or_default()
+    } else {
+        config.terminal.shell.clone()
+    };
+    let padding = config.window.padding;
+    let initial_metrics = CellMetrics {
+        width: config.font.size * 0.6,
+        height: config.font.size * config.font.line_height,
+        baseline_offset: config.font.size * config.font.line_height * 0.8,
+        ascent: config.font.size * config.font.line_height * 0.8,
+    };
+    let (initial_cols, initial_rows) = grid_size(
+        config.window.width,
+        config.window.height,
+        &initial_metrics,
+        padding,
+    );
+    // On macOS, fork() after GUI/canvas/font runtime initialization can leave
+    // the child in a bad state. Spawn the PTY first, then resize it after exact
+    // font metrics are known.
+    let term_result = TerminalSession::spawn(SpawnOverrides {
+        cols: initial_cols,
+        rows: initial_rows,
+        shell: &resolved_shell,
+        args: platform::shell_args(&resolved_shell),
+        env: platform::terminal_env(),
+        working_directory: &config.terminal.working_directory,
+    });
+
     let mut window = Window::new(
         DEFAULT_TITLE,
         config.window.width as i32,
@@ -214,29 +245,15 @@ fn main() -> AureaResult<()> {
     let mut row_fonts = RowFonts::new(primary_font, fallback_fonts);
     let metrics = cell_metrics(&config, &canvas_arc, &mut row_fonts);
 
-    // Prefer PowerShell on Windows when the user hasn't set an explicit shell.
-    let resolved_shell = if config.terminal.shell.is_empty() {
-        platform::preferred_shell().unwrap_or_default()
-    } else {
-        config.terminal.shell.clone()
-    };
-
-    let padding = config.window.padding;
     let (cols, rows) = grid_size(config.window.width, config.window.height, &metrics, padding);
-    let mut term = match TerminalSession::spawn(SpawnOverrides {
-        cols,
-        rows,
-        shell: &resolved_shell,
-        args: platform::shell_args(&resolved_shell),
-        env: platform::terminal_env(),
-        working_directory: &config.terminal.working_directory,
-    }) {
+    let mut term = match term_result {
         Ok(term) => term,
         Err(err) => {
             let message = format!("failed to spawn default shell: {err}");
             return wait_for_close_with_message(&window, &canvas_arc, &row_fonts.primary, &message);
         }
     };
+    let _ = term.resize(cols, rows);
 
     let mut cursor_visible = true;
     let mut last_blink = Instant::now();
