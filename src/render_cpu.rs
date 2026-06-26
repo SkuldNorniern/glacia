@@ -133,7 +133,7 @@ impl RowFonts {
 
     /// Prime glyph-support caches for common terminal and multilingual text.
     /// Any character not listed here is still resolved lazily during drawing.
-    pub fn probe(&mut self, ctx: &mut dyn DrawingContext, _cell_width: f32) {
+    pub fn probe(&self, ctx: &mut dyn DrawingContext, _cell_width: f32) {
         for ch in [
             '\u{2500}',
             '\u{2502}',

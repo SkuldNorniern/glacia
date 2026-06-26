@@ -14,7 +14,7 @@ use aurea::render::{Canvas, Rect};
 
 /// Locks the mutex, recovering from poisoning rather than panicking.
 pub fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// A `Canvas` marked `Send`/`Sync` so it can live in an `Arc<Mutex<…>>`.

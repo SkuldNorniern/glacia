@@ -99,14 +99,12 @@ pub struct Config {
 
 fn as_u32(v: Option<&Value>) -> Option<u32> {
     v.and_then(Value::as_integer)
-        .filter(|i| *i >= 0)
-        .map(|i| i as u32)
+        .and_then(|i| u32::try_from(i).ok())
 }
 
 fn as_u64(v: Option<&Value>) -> Option<u64> {
     v.and_then(Value::as_integer)
-        .filter(|i| *i >= 0)
-        .map(|i| i as u64)
+        .and_then(|i| u64::try_from(i).ok())
 }
 
 fn as_f32(v: Option<&Value>) -> Option<f32> {
@@ -151,7 +149,7 @@ impl Config {
                 && v != "auto"
                 && !v.trim().is_empty()
             {
-                config.font.family = v.to_owned();
+                v.clone_into(&mut config.font.family);
             }
             if let Some(v) = font.get("fallback").and_then(Value::as_str)
                 && !v.trim().is_empty()
@@ -172,10 +170,10 @@ impl Config {
 
         if let Some(terminal) = table.get("terminal").and_then(Value::as_table) {
             if let Some(v) = terminal.get("shell").and_then(Value::as_str) {
-                config.terminal.shell = v.to_owned();
+                v.clone_into(&mut config.terminal.shell);
             }
             if let Some(v) = terminal.get("working_directory").and_then(Value::as_str) {
-                config.terminal.working_directory = v.to_owned();
+                v.clone_into(&mut config.terminal.working_directory);
             }
         }
 
