@@ -227,6 +227,7 @@ impl RowFonts {
         let Ok(metrics) = ctx.measure_text(&text, self.regular_font(slot)) else {
             return false;
         };
+        #[cfg(target_os = "macos")]
         if slot > 0 && is_hangul_codepoint(ch) {
             return metrics.advance > 0.1;
         }
@@ -266,6 +267,7 @@ fn is_zero_width_joiner(c: char) -> bool {
     matches!(c as u32, 0x200C | 0x200D)
 }
 
+#[cfg(target_os = "macos")]
 fn is_hangul_codepoint(c: char) -> bool {
     matches!(
         c as u32,
