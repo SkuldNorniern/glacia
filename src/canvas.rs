@@ -38,6 +38,12 @@ impl Element for SendableCanvas {
     fn handle(&self) -> *mut c_void {
         self.0.handle()
     }
+    fn released_to_parent(&self) {
+        // Forwarded to the canvas underneath, which is what owns the native
+        // element: once a container has taken it, it must stop freeing it or
+        // the element would be destroyed twice.
+        self.0.released_to_parent();
+    }
     unsafe fn invalidate_platform(&self, rect: Option<Rect>) {
         unsafe { Element::invalidate_platform(&self.0, rect) }
     }
@@ -49,6 +55,9 @@ pub struct SharedCanvas(pub Arc<Mutex<SendableCanvas>>);
 impl Element for SharedCanvas {
     fn handle(&self) -> *mut c_void {
         lock(self.0.as_ref()).handle()
+    }
+    fn released_to_parent(&self) {
+        lock(self.0.as_ref()).released_to_parent();
     }
     unsafe fn invalidate_platform(&self, rect: Option<Rect>) {
         let g = lock(self.0.as_ref());
