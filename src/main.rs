@@ -3,7 +3,6 @@
 // `cargo run` still shows panics/stderr in the launching console.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod canvas;
 mod config;
 mod input;
 mod platform;
@@ -13,7 +12,6 @@ mod terminal;
 mod theme;
 mod unicode;
 
-use std::sync::{Arc, Mutex};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -22,7 +20,7 @@ use aurea::render::{Canvas, Font, RendererBackend};
 use aurea::{AureaResult, KeyCode, MouseButton, Window, WindowEvent};
 use aurea::{clipboard_text, set_clipboard_text};
 
-use canvas::{SendableCanvas, SharedCanvas, lock};
+use aurea::render::SharedCanvas;
 use config::Config;
 use render_cpu::{CellMetrics, CellRowsView, RowFonts, SelectionRange};
 use terminal::{SpawnOverrides, TerminalSession};
@@ -41,7 +39,7 @@ const DEFAULT_TITLE: &str = "Glacia";
 /// codepoints the primary font lacks so fallback routing is automatic.
 fn cell_metrics(
     config: &Config,
-    canvas: &Arc<Mutex<SendableCanvas>>,
+    canvas: &SharedCanvas,
     row_fonts: &mut RowFonts,
 ) -> CellMetrics {
     let configured_h = config.font.size * config.font.line_height;
@@ -50,7 +48,7 @@ fn cell_metrics(
     let mut baseline_offset = configured_h * 0.8;
     let mut ascent = configured_h * 0.8;
 
-    let _ = lock(canvas.as_ref()).draw(|ctx| {
+    let _ = canvas.get().draw(|ctx| {
         if let Ok(m) = ctx.measure_text("M", &row_fonts.primary) {
             if m.ascent > 0.0 {
                 let font_h = m.ascent + m.descent;
@@ -139,12 +137,12 @@ fn display_shell_name(raw: &str) -> &str {
 /// alongside (e.g. the shell failed to spawn).
 fn wait_for_close_with_message(
     window: &Window,
-    canvas_arc: &Arc<Mutex<SendableCanvas>>,
+    canvas_arc: &SharedCanvas,
     font: &Font,
     message: &str,
 ) -> AureaResult<()> {
     {
-        let mut canvas = lock(canvas_arc.as_ref());
+        let mut canvas = canvas_arc.get();
         canvas.draw(|ctx| render_cpu::draw_fatal_message(ctx, message, font))?;
     }
     loop {
@@ -222,8 +220,8 @@ fn main() -> AureaResult<()> {
     // draw path start from the correct dark color — no redundant white clear.
     raw_canvas.set_background_color(theme::BACKGROUND);
     raw_canvas.set_draw_callback(|ctx| ctx.clear(theme::BACKGROUND))?;
-    let canvas_arc = Arc::new(Mutex::new(SendableCanvas(raw_canvas)));
-    window.set_content(SharedCanvas(canvas_arc.clone()))?;
+    let canvas_arc = SharedCanvas::new(raw_canvas);
+    window.set_content(canvas_arc.clone())?;
 
     // Build fonts once. RowFonts owns the bold variants so they are not
     // re-cloned on every frame.
@@ -497,7 +495,7 @@ fn main() -> AureaResult<()> {
         // by a few pixels (title-bar inclusion, DPI rounding). Using stale dimensions
         // makes the grid slightly too large, causing the last row/column to be clipped.
         {
-            let actual = lock(canvas_arc.as_ref()).size();
+            let actual = canvas_arc.get().size();
             if actual.0 > 0 && actual.1 > 0 && actual != window_size {
                 window_size = actual;
                 let (nc, nr) = grid_size(actual.0, actual.1, &metrics, padding);
@@ -552,7 +550,7 @@ fn main() -> AureaResult<()> {
             let active_sel = sel_anchor
                 .zip(sel_end)
                 .map(|(a, e)| SelectionRange::new(a, e));
-            let mut canvas = lock(canvas_arc.as_ref());
+            let mut canvas = canvas_arc.get();
             // `canvas.draw()` invalidates the native surface itself; an extra
             // `invalidate_all()` here would trigger a second native repaint
             // that re-runs the registered `set_draw_callback` (background
