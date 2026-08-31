@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 const S_BASE: u32 = 0xAC00;
 const L_BASE: u32 = 0x1100;
 const V_BASE: u32 = 0x1161;
@@ -7,9 +9,9 @@ const V_COUNT: u32 = 21;
 const T_COUNT: u32 = 28;
 const N_COUNT: u32 = V_COUNT * T_COUNT;
 
-pub fn compose_hangul_jamo(text: &str) -> std::borrow::Cow<'_, str> {
+pub fn compose_hangul_jamo(text: &str) -> Cow<'_, str> {
     if !text.chars().any(is_hangul_jamo) {
-        return std::borrow::Cow::Borrowed(text);
+        return Cow::Borrowed(text);
     }
     let chars: Vec<char> = text.chars().collect();
     let mut out = String::with_capacity(text.len());
@@ -47,7 +49,7 @@ pub fn compose_hangul_jamo(text: &str) -> std::borrow::Cow<'_, str> {
         }
     }
 
-    std::borrow::Cow::Owned(out)
+    Cow::Owned(out)
 }
 
 pub fn is_hangul_jamo(c: char) -> bool {
@@ -153,6 +155,8 @@ fn trailing_index(c: char) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
+
     use super::compose_hangul_jamo;
 
     #[test]

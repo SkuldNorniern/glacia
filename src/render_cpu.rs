@@ -30,7 +30,12 @@ pub struct CellRowsView<'a> {
 impl<'a> CellRowsView<'a> {
     /// View over the live screen only (scroll_offset == 0).
     pub fn from_screen(screen: &'a [Vec<Cell>]) -> Self {
-        Self { sb: &[], screen, start: 0, len: screen.len() }
+        Self {
+            sb: &[],
+            screen,
+            start: 0,
+            len: screen.len(),
+        }
     }
 
     /// View over a window spanning both scrollback and screen (scroll_offset > 0).
@@ -40,7 +45,12 @@ impl<'a> CellRowsView<'a> {
         start: usize,
         end: usize,
     ) -> Self {
-        Self { sb, screen, start, len: end.saturating_sub(start) }
+        Self {
+            sb,
+            screen,
+            start,
+            len: end.saturating_sub(start),
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -673,7 +683,9 @@ pub fn draw_grid(
     let line_h = metrics.height;
 
     for row_idx in 0..rows.len() {
-        let Some(row) = rows.get(row_idx) else { continue };
+        let Some(row) = rows.get(row_idx) else {
+            continue;
+        };
         let y_top = row_idx as f32 * line_h + padding;
         let sel_cols = selection.and_then(|s| s.cols_for_row(row_idx, row.len()));
         draw_row(
@@ -698,7 +710,10 @@ pub fn draw_grid(
                 let cursor_width = metrics.width * cursor_width_cells;
                 match cursor_shape {
                     CursorShape::Block => {
-                        ctx.draw_rect(Rect::new(x, y, cursor_width, line_h), &solid(theme::CURSOR))?;
+                        ctx.draw_rect(
+                            Rect::new(x, y, cursor_width, line_h),
+                            &solid(theme::CURSOR),
+                        )?;
                         if let Some(cell) = cursor_row.get(cursor_col) {
                             let text = composed_cell_text(cell);
                             if !text.trim().is_empty() {
