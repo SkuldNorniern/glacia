@@ -20,7 +20,6 @@ use aurea::render::{Canvas, Font, RendererBackend};
 use aurea::{AureaResult, KeyCode, MouseButton, Window, WindowEvent};
 use aurea::{clipboard_text, set_clipboard_text};
 
-use aurea::render::SharedCanvas;
 use config::Config;
 use render_cpu::{CellMetrics, CellRowsView, RowFonts, SelectionRange};
 use terminal::{SpawnOverrides, TerminalSession};
@@ -37,18 +36,14 @@ const DEFAULT_TITLE: &str = "Glacia";
 /// ascent+descent rather than a fixed fraction, preventing the last row's
 /// descenders from being clipped at the canvas edge. Also probes which
 /// codepoints the primary font lacks so fallback routing is automatic.
-fn cell_metrics(
-    config: &Config,
-    canvas: &SharedCanvas,
-    row_fonts: &mut RowFonts,
-) -> CellMetrics {
+fn cell_metrics(config: &Config, canvas: &Canvas, row_fonts: &mut RowFonts) -> CellMetrics {
     let configured_h = config.font.size * config.font.line_height;
     let mut width = config.font.size * 0.6;
     let mut height = configured_h;
     let mut baseline_offset = configured_h * 0.8;
     let mut ascent = configured_h * 0.8;
 
-    let _ = canvas.get().draw(|ctx| {
+    let _ = canvas.clone().draw(|ctx| {
         if let Ok(m) = ctx.measure_text("M", &row_fonts.primary) {
             if m.ascent > 0.0 {
                 let font_h = m.ascent + m.descent;
@@ -137,12 +132,12 @@ fn display_shell_name(raw: &str) -> &str {
 /// alongside (e.g. the shell failed to spawn).
 fn wait_for_close_with_message(
     window: &Window,
-    canvas_arc: &SharedCanvas,
+    canvas_arc: &Canvas,
     font: &Font,
     message: &str,
 ) -> AureaResult<()> {
     {
-        let mut canvas = canvas_arc.get();
+        let mut canvas = canvas_arc.clone();
         canvas.draw(|ctx| render_cpu::draw_fatal_message(ctx, message, font))?;
     }
     loop {
@@ -220,7 +215,7 @@ fn main() -> AureaResult<()> {
     // draw path start from the correct dark color — no redundant white clear.
     raw_canvas.set_background_color(theme::BACKGROUND);
     raw_canvas.set_draw_callback(|ctx| ctx.clear(theme::BACKGROUND))?;
-    let canvas_arc = SharedCanvas::new(raw_canvas);
+    let canvas_arc = raw_canvas;
     window.set_content(canvas_arc.clone())?;
 
     // Build fonts once. RowFonts owns the bold variants so they are not
@@ -495,7 +490,7 @@ fn main() -> AureaResult<()> {
         // by a few pixels (title-bar inclusion, DPI rounding). Using stale dimensions
         // makes the grid slightly too large, causing the last row/column to be clipped.
         {
-            let actual = canvas_arc.get().size();
+            let actual = canvas_arc.size();
             if actual.0 > 0 && actual.1 > 0 && actual != window_size {
                 window_size = actual;
                 let (nc, nr) = grid_size(actual.0, actual.1, &metrics, padding);
@@ -550,7 +545,7 @@ fn main() -> AureaResult<()> {
             let active_sel = sel_anchor
                 .zip(sel_end)
                 .map(|(a, e)| SelectionRange::new(a, e));
-            let mut canvas = canvas_arc.get();
+            let mut canvas = canvas_arc.clone();
             // `canvas.draw()` invalidates the native surface itself; an extra
             // `invalidate_all()` here would trigger a second native repaint
             // that re-runs the registered `set_draw_callback` (background
