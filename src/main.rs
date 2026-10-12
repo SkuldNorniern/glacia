@@ -12,10 +12,8 @@ mod terminal;
 mod theme;
 mod unicode;
 
-use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use aurea::ffi::ng_platform_poll_events;
 use aurea::render::{Canvas, Font, RendererBackend};
 use aurea::{AureaResult, KeyCode, MouseButton, Window, WindowEvent};
 use aurea::{clipboard_text, set_clipboard_text};
@@ -141,16 +139,13 @@ fn wait_for_close_with_message(
         canvas.draw(|ctx| render_cpu::draw_fatal_message(ctx, message, font))?;
     }
     loop {
-        unsafe { ng_platform_poll_events() };
-        let events = window.poll_events();
+        let events = window.wait_events(None);
         if events
             .iter()
             .any(|event| matches!(event, WindowEvent::CloseRequested))
         {
             break;
         }
-        window.process_frames()?;
-        sleep(POLL_INTERVAL);
     }
     Ok(())
 }
@@ -266,9 +261,14 @@ fn main() -> AureaResult<()> {
     let mut mouse_dragging = false;
 
     loop {
-        unsafe { ng_platform_poll_events() };
-
-        let events = window.poll_events();
+        // Input ends the wait at once; otherwise it lasts until the next
+        // frame is due, or a poll interval for new shell output.
+        let timeout = if needs_redraw {
+            FRAME_INTERVAL.saturating_sub(last_render.elapsed())
+        } else {
+            POLL_INTERVAL
+        };
+        let events = window.wait_events(Some(timeout));
         let mut should_close = false;
         for event in &events {
             match event {
@@ -595,9 +595,6 @@ fn main() -> AureaResult<()> {
             needs_redraw = false;
             last_render = Instant::now();
         }
-
-        window.process_frames()?;
-        sleep(POLL_INTERVAL);
     }
 
     Ok(())
