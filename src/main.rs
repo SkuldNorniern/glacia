@@ -307,7 +307,7 @@ fn main() -> AureaResult<()> {
                     }
                     needs_redraw = true;
                 }
-                WindowEvent::MouseMove { x, y } => {
+                WindowEvent::MouseMove { x, y, .. } => {
                     if mouse_dragging {
                         sel_end = Some(px_to_cell(*x, *y, &metrics, padding as f32));
                         needs_redraw = true;
