@@ -1,0 +1,7 @@
+# with the C runtime linked in, the exe starts on a fresh Windows without
+# the Visual C++ redistributable, which the setup does not install.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
