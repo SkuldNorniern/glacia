@@ -1,0 +1,22 @@
+# the Windows setup: `kago build` builds glacia and writes it to dist/.
+package dev.eira.glacia
+  name Glacia
+  version from cargo
+  publisher Eira
+  description Terminal emulator
+  homepage https://github.com/SkuldNorniern/glacia
+  scope choose
+
+license LICENSE
+
+build cargo build --release
+
+app glacia
+  windows target/release/glacia.exe
+  icon windows assets/glacia-term-icon.ico
+
+shortcut
+path optional "Add glacia to PATH"
+
+component desktop "Desktop shortcut" off
+  shortcut desktop

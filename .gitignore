@@ -27,3 +27,7 @@ target
 
 # Local tooling scripts — run locally, never committed
 /tools/
+
+# kago setup output and download cache
+/dist/
+/.kago/
