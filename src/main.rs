@@ -77,6 +77,18 @@ fn attach_canvas(
     Ok(canvas)
 }
 
+/// The GPU canvas when the config asks for it and a GPU opens, else the CPU
+/// one. A GPU is only opened on the first draw, so that draw is the test.
+fn open_canvas(window: &mut Window, config: &Config) -> AureaResult<Canvas> {
+    if config.render.gpu
+        && let Ok(mut canvas) = attach_canvas(window, config, RendererBackend::ZenGpu)
+        && canvas.draw(|ctx| ctx.clear(theme::BACKGROUND)).is_ok()
+    {
+        return Ok(canvas);
+    }
+    attach_canvas(window, config, RendererBackend::Cpu)
+}
+
 /// The configured font, then the configured fallbacks, then the platform's.
 fn row_fonts(config: &Config) -> RowFonts {
     let mut families = config.font.fallbacks.clone();
@@ -152,7 +164,7 @@ fn main() -> AureaResult<()> {
         config.window.width as i32,
         config.window.height as i32,
     )?;
-    let mut canvas = attach_canvas(&mut window, &config, RendererBackend::Cpu)?;
+    let mut canvas = open_canvas(&mut window, &config)?;
     let mut fonts = row_fonts(&config);
     let metrics = cell_metrics(&config, &canvas, &mut fonts);
 

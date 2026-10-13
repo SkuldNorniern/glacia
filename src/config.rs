@@ -90,8 +90,17 @@ impl Default for CursorConfig {
 }
 
 #[derive(Debug, Clone, Default)]
+pub struct RenderConfig {
+    /// Draw on the GPU. Off by default: the GPU driver alone takes about
+    /// 200 MB, against a few MB for the CPU path. Falls back to the CPU
+    /// when no GPU opens.
+    pub gpu: bool,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct Config {
     pub window: WindowConfig,
+    pub render: RenderConfig,
     pub font: FontConfig,
     pub terminal: TerminalConfig,
     pub cursor: CursorConfig,
@@ -142,6 +151,15 @@ impl Config {
             if let Some(v) = as_u32(window.get("padding")) {
                 config.window.padding = v.min(64);
             }
+        }
+
+        if let Some(gpu) = table
+            .get("render")
+            .and_then(Value::as_table)
+            .and_then(|render| render.get("gpu"))
+            .and_then(Value::as_bool)
+        {
+            config.render.gpu = gpu;
         }
 
         if let Some(font) = table.get("font").and_then(Value::as_table) {
@@ -247,6 +265,9 @@ fn write_default_template(path: &Path) -> Option<String> {
 # height  = 800
 # padding = 4
 
+[render]
+# gpu = false  # true draws on the GPU; it uses far more memory
+
 [font]
 # family      = \"{default_font}\"  # \"auto\" uses the platform default monospace
 # fallback    = \"\"                # comma-separated fallback cascade; empty = platform defaults
@@ -268,4 +289,23 @@ fn write_default_template(path: &Path) -> Option<String> {
         return Some(format!("could not write {}: {e}", path.display()));
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_gpu_is_off_unless_asked_for() {
+        assert!(!Config::parse_str("").0.render.gpu);
+        assert!(
+            Config::parse_str(
+                "[render]
+gpu = true"
+            )
+            .0
+            .render
+            .gpu
+        );
+    }
 }

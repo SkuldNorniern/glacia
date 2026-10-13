@@ -12,7 +12,7 @@ unwrap_used = "warn"
 expect_used = "warn"
 
 [dependencies]
-aurea = { git = "https://github.com/SkuldNorniern/aurea" }
+aurea = { git = "https://github.com/SkuldNorniern/aurea", features = ["zengpu"] }
 vanta = { git = "https://github.com/SkuldNorniern/vanta" }
 toml = "0.9"
 
