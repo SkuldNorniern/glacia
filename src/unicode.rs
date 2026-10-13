@@ -155,8 +155,6 @@ fn trailing_index(c: char) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use std::borrow::Cow;
-
     use super::compose_hangul_jamo;
 
     #[test]

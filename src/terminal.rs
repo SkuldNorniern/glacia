@@ -1,7 +1,7 @@
 //! Thin wrapper around `vanta::Terminal`.
 //!
-//! Glacia's calls into Vanta funnel through here so the migration tracked in
-//! `PLAN.md`'s "Vanta API Contract" table only ever touches this one file.
+//! Glacia's calls into Vanta funnel through here, so a Vanta API change
+//! only touches this one file.
 
 use std::ffi::OsString;
 use std::io;
