@@ -69,7 +69,9 @@ pub fn terminal_key_bytes(key: KeyCode, mods: Modifiers, app_cursor: bool) -> Op
         // Ctrl+Backspace is ^H, the word rub-out PowerShell and some shells use
         KeyCode::Backspace if mods.ctrl => "\x08".to_owned(),
         KeyCode::Backspace => "\x7f".to_owned(),
-        KeyCode::Tab if mods.shift => return Some("\x1b[Z".to_owned()),
+        // back-tab; with ctrl it carries the modifier code like the others
+        KeyCode::Tab if mods.shift && mods.ctrl => return Some(format!("\x1b[1;{code}Z")),
+        KeyCode::Tab if mods.shift => "\x1b[Z".to_owned(),
         KeyCode::Tab => "\t".to_owned(),
         KeyCode::Escape => "\x1b".to_owned(),
         KeyCode::Space if mods.ctrl => "\0".to_owned(),
@@ -79,9 +81,13 @@ pub fn terminal_key_bytes(key: KeyCode, mods: Modifiers, app_cursor: bool) -> Op
                 // Ctrl+[A-Z] = codepoint - 64
                 char::from(c.to_ascii_uppercase() as u8 - b'@').to_string()
             } else if mods.alt {
-                // Alt+letter sends ESC + the lowercase letter regardless of
-                // shift, like xterm in its default meta mode
-                c.to_string()
+                // Alt+letter is ESC + the letter as typed: shift makes it
+                // upper case, like xterm's meta-sends-escape
+                if mods.shift {
+                    c.to_ascii_uppercase().to_string()
+                } else {
+                    c.to_string()
+                }
             } else {
                 return None;
             }
@@ -567,6 +573,9 @@ mod tests {
     fn ctrl_and_alt_letters() {
         assert_eq!(key(KeyCode::C, false, true, false, false), "\x03");
         assert_eq!(key(KeyCode::B, false, false, true, false), "\x1bb");
+        assert_eq!(key(KeyCode::B, true, false, true, false), "\x1bB");
+        assert_eq!(key(KeyCode::Tab, true, false, true, false), "\x1b\x1b[Z");
+        assert_eq!(key(KeyCode::Tab, true, true, false, false), "\x1b[1;6Z");
         assert_eq!(key(KeyCode::X, false, true, true, false), "\x1b\x18");
         assert_eq!(key(KeyCode::Space, false, true, false, false), "\0");
         assert_eq!(

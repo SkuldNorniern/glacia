@@ -35,8 +35,11 @@ fn px_to_cell(x: f64, y: f64, metrics: &CellMetrics, padding: f32) -> (usize, us
 /// Clipboard text made safe to paste: no paste-end marker that would let
 /// the rest run as typed commands, and line breaks as the CR Enter sends.
 fn paste_text(text: &str) -> String {
-    text.replace("\x1b[200~", "")
-        .replace("\x1b[201~", "")
+    // no escape at all: taking out one marker could join the pieces around
+    // it into another (`ESC[2 ESC[201~ 01~`)
+    text.chars()
+        .filter(|c| !matches!(c, '\x1b' | '\u{9b}'))
+        .collect::<String>()
         .replace("\r\n", "\r")
         .replace('\n', "\r")
 }
@@ -520,7 +523,11 @@ mod tests {
 
     #[test]
     fn paste_cannot_end_bracketed_paste_early() {
-        assert_eq!(paste_text("a\x1b[201~rm -rf x\r\nb\nc"), "arm -rf x\rb\rc");
+        assert_eq!(
+            paste_text("a\x1b[201~rm -rf x\r\nb\nc"),
+            "a[201~rm -rf x\rb\rc"
+        );
+        assert!(!paste_text("\x1b[2\x1b[201~01~").contains('\x1b'));
     }
 
     #[test]
