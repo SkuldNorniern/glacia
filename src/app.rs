@@ -32,6 +32,15 @@ fn px_to_cell(x: f64, y: f64, metrics: &CellMetrics, padding: f32) -> (usize, us
     (row, col)
 }
 
+/// Clipboard text made safe to paste: no paste-end marker that would let
+/// the rest run as typed commands, and line breaks as the CR Enter sends.
+fn paste_text(text: &str) -> String {
+    text.replace("\x1b[200~", "")
+        .replace("\x1b[201~", "")
+        .replace("\r\n", "\r")
+        .replace('\n', "\r")
+}
+
 /// Extract plain text for the cells covered by `sel` from the given rows.
 fn extract_selection_text(rows: &[Vec<Cell>], sel: SelectionRange) -> String {
     let mut result = String::new();
@@ -223,8 +232,13 @@ impl App {
             } => self.on_left_button(*pressed, *x, *y),
             WindowEvent::MouseMove { x, y, .. } if self.mouse_dragging => {
                 let pad = self.padding() as f32;
-                self.sel_end = Some(px_to_cell(*x, *y, &self.metrics, pad));
-                self.needs_redraw = true;
+                let cell = px_to_cell(*x, *y, &self.metrics, pad);
+                // a selection starts once the pointer leaves the cell it
+                // was pressed in; a plain click selects nothing
+                if self.sel_end.is_some() || self.sel_anchor != Some(cell) {
+                    self.sel_end = Some(cell);
+                    self.needs_redraw = true;
+                }
             }
             WindowEvent::KeyInput {
                 key,
@@ -242,7 +256,7 @@ impl App {
         if pressed {
             let cell = px_to_cell(x, y, &self.metrics, self.padding() as f32);
             self.sel_anchor = Some(cell);
-            self.sel_end = Some(cell);
+            self.sel_end = None;
         }
         self.mouse_dragging = pressed;
         self.needs_redraw = true;
@@ -255,8 +269,10 @@ impl App {
         } else if copy_paste && key == KeyCode::V {
             self.paste();
         } else if self.term.is_alt_screen() {
-            self.on_app_key(key, modifiers);
-        } else if !self.on_history_key(key) {
+            // the app owns scrolling: every key goes to it
+            self.send_key(key, modifiers);
+        } else if !(modifiers.shift && self.on_history_key(key)) {
+            // scrollback is shift+page/home/end; plain ones go to the shell
             self.send_key(key, modifiers);
         }
     }
@@ -277,6 +293,7 @@ impl App {
             return;
         };
         self.scroll_offset = 0;
+        let text = paste_text(&text);
         if self.term.bracketed_paste_enabled() {
             self.send(&format!("\x1b[200~{text}\x1b[201~"));
         } else {
@@ -284,21 +301,10 @@ impl App {
         }
     }
 
-    /// On the alternate screen the app owns scrolling, so PageUp/Down go to
-    /// it as VT sequences for vim/less/htop.
-    fn on_app_key(&mut self, key: KeyCode, modifiers: Modifiers) {
-        match key {
-            KeyCode::PageUp => self.send("\x1b[5~"),
-            KeyCode::PageDown => self.send("\x1b[6~"),
-            _ => self.send_key(key, modifiers),
-        }
-    }
-
     /// Scrollback keys on the normal screen. Returns false for a key that
     /// should go to the shell instead.
     fn on_history_key(&mut self, key: KeyCode) -> bool {
-        let visible_rows = (self.window_size.1 as f32 / self.metrics.height).max(1.0) as usize;
-        let page = visible_rows / 2;
+        let page = (self.visible_rows() / 2).max(1);
         let max_scroll = self.term.scrollback_rows().len();
         self.scroll_offset = match key {
             KeyCode::PageUp => (self.scroll_offset + page).min(max_scroll),
@@ -318,7 +324,8 @@ impl App {
     }
 
     fn send_key(&mut self, key: KeyCode, modifiers: Modifiers) {
-        let Some(bytes) = input::terminal_key_bytes(key, modifiers) else {
+        let app_cursor = self.term.application_cursor_keys();
+        let Some(bytes) = input::terminal_key_bytes(key, modifiers, app_cursor) else {
             return;
         };
         if !self.term.is_alt_screen() {
@@ -331,10 +338,17 @@ impl App {
     fn on_wheel(&mut self, delta_y: f64) {
         let up = wheel_scrolls_up(delta_y);
         let lines = (delta_y.abs() * 3.0).ceil() as usize;
+        // the selection is in screen cells; it would point at other text
+        self.clear_selection();
         if self.term.is_alt_screen() {
             // Wheel as arrow keys, the same sequences vim/less/htop get from
             // the keyboard.
-            let seq = if up { "\x1b[A" } else { "\x1b[B" };
+            let seq = match (up, self.term.application_cursor_keys()) {
+                (true, true) => "\x1bOA",
+                (true, false) => "\x1b[A",
+                (false, true) => "\x1bOB",
+                (false, false) => "\x1b[B",
+            };
             for _ in 0..lines {
                 let _ = self.term.write_str(seq);
             }
@@ -377,7 +391,14 @@ impl App {
     /// while the shell is quiet.
     fn pump_shell(&mut self, window: &Window) {
         let blink = Duration::from_millis(self.config.cursor.blink_interval_ms);
+        let history = self.term.scrollback_rows().len();
         if self.term.sync() {
+            // scrolled back: stay on the same lines while new ones come in
+            if self.scroll_offset > 0 {
+                let grown = self.term.scrollback_rows().len().saturating_sub(history);
+                let max_scroll = self.term.scrollback_rows().len();
+                self.scroll_offset = (self.scroll_offset + grown).min(max_scroll);
+            }
             self.wake_cursor();
             self.last_output = Instant::now();
             // A TUI app just started: show all of its screen.
@@ -412,12 +433,17 @@ impl App {
         self.last_title = title;
     }
 
+    /// Rows that fit inside the padding.
+    fn visible_rows(&self) -> usize {
+        let padding = self.padding();
+        (self.window_size.1.saturating_sub(2 * padding) as f32 / self.metrics.height).max(1.0)
+            as usize
+    }
+
     fn draw(&mut self, canvas: &mut Canvas) -> AureaResult<()> {
         let padding = self.padding();
         let pad = padding as f32;
-        let visible_rows = (self.window_size.1.saturating_sub(2 * padding) as f32
-            / self.metrics.height)
-            .max(1.0) as usize;
+        let visible_rows = self.visible_rows();
         let selection = self
             .sel_anchor
             .zip(self.sel_end)
@@ -490,6 +516,11 @@ mod tests {
         assert_eq!(px_to_cell(4.0, 4.0, &metrics(), 4.0), (0, 0));
         assert_eq!(px_to_cell(35.0, 45.0, &metrics(), 4.0), (2, 3));
         assert_eq!(px_to_cell(0.0, 0.0, &metrics(), 4.0), (0, 0), "clamped");
+    }
+
+    #[test]
+    fn paste_cannot_end_bracketed_paste_early() {
+        assert_eq!(paste_text("a\x1b[201~rm -rf x\r\nb\nc"), "arm -rf x\rb\rc");
     }
 
     #[test]

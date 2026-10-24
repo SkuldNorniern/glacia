@@ -21,6 +21,7 @@ pub struct TerminalSession {
     cursor_visible: bool,
     is_alt_screen: bool,
     bracketed_paste: bool,
+    application_cursor_keys: bool,
 }
 
 /// Overrides for the spawned shell. Empty `shell`/`working_directory` mean
@@ -57,6 +58,7 @@ impl TerminalSession {
             cursor_visible: true,
             is_alt_screen: false,
             bracketed_paste: false,
+            application_cursor_keys: false,
         })
     }
 
@@ -65,10 +67,12 @@ impl TerminalSession {
     /// only, not scrollback, with the cursor row rebased to screen-relative —
     /// scrollback viewport rendering is a near-term follow-up, not this slice.
     pub fn sync(&mut self) -> bool {
-        let snapshot = self.term.snapshot();
-        if snapshot.version == self.last_version {
+        // the version is one atomic load; a snapshot copies the screen and
+        // all of scrollback, so only take one when something changed
+        if self.term.version() == self.last_version {
             return false;
         }
+        let snapshot = self.term.snapshot();
         self.last_version = snapshot.version;
         let (line, col) = snapshot.cursor;
         // Vanta's cx reaches `cols` in "pending wrap" state (last column filled,
@@ -80,6 +84,7 @@ impl TerminalSession {
         self.cursor_visible = snapshot.cursor_visible;
         self.is_alt_screen = snapshot.is_alt_screen;
         self.bracketed_paste = snapshot.bracketed_paste;
+        self.application_cursor_keys = snapshot.application_cursor_keys;
         true
     }
 
@@ -112,6 +117,12 @@ impl TerminalSession {
     /// When true, clipboard pastes must be wrapped in ESC[200~ … ESC[201~.
     pub fn bracketed_paste_enabled(&self) -> bool {
         self.bracketed_paste
+    }
+
+    /// Whether the app asked for application cursor keys (DECCKM): arrows
+    /// then go as `ESC O x`.
+    pub fn application_cursor_keys(&self) -> bool {
+        self.application_cursor_keys
     }
 
     pub fn write_str(&self, s: &str) -> io::Result<()> {
