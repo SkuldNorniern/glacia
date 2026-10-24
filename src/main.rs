@@ -13,7 +13,10 @@ mod terminal;
 mod theme;
 mod unicode;
 
+use std::sync::{Arc, OnceLock};
+
 use aurea::render::{Canvas, Font, RendererBackend};
+use aurea::window::WindowProxy;
 use aurea::{AureaResult, Window, WindowEvent};
 
 use app::{App, DEFAULT_TITLE, grid_size};
@@ -150,20 +153,35 @@ fn main() -> AureaResult<()> {
     // On macOS, fork() after GUI/canvas/font runtime initialization can leave
     // the child in a bad state. Spawn the PTY first, then resize it after exact
     // font metrics are known.
-    let term = TerminalSession::spawn(SpawnOverrides {
-        cols,
-        rows,
-        shell: &shell,
-        args: platform::shell_args(&shell),
-        env: platform::terminal_env(),
-        working_directory: &config.terminal.working_directory,
-    });
+    // The window doesn't exist yet when the shell starts; its proxy lands
+    // here once it does, and output wakes the event loop through it.
+    let proxy: Arc<OnceLock<WindowProxy>> = Arc::default();
+    let wake = {
+        let proxy = Arc::clone(&proxy);
+        move || {
+            if let Some(proxy) = proxy.get() {
+                proxy.wake();
+            }
+        }
+    };
+    let term = TerminalSession::spawn(
+        SpawnOverrides {
+            cols,
+            rows,
+            shell: &shell,
+            args: platform::shell_args(&shell),
+            env: platform::terminal_env(),
+            working_directory: &config.terminal.working_directory,
+        },
+        wake,
+    );
 
     let mut window = Window::new(
         DEFAULT_TITLE,
         config.window.width as i32,
         config.window.height as i32,
     )?;
+    let _ = proxy.set(window.proxy());
     let mut canvas = open_canvas(&mut window, &config)?;
     let mut fonts = row_fonts(&config);
     let metrics = cell_metrics(&config, &canvas, &mut fonts);

@@ -22,6 +22,8 @@ pub struct TerminalSession {
     is_alt_screen: bool,
     bracketed_paste: bool,
     application_cursor_keys: bool,
+    /// Lines dropped off the top of scrollback so far.
+    dropped: u64,
 }
 
 /// Overrides for the spawned shell. Empty `shell`/`working_directory` mean
@@ -36,7 +38,12 @@ pub struct SpawnOverrides<'a> {
 }
 
 impl TerminalSession {
-    pub fn spawn(overrides: SpawnOverrides<'_>) -> io::Result<Self> {
+    /// Spawns the shell. `wake` runs on Vanta's reader thread after each
+    /// chunk of output and at the end, so the event loop can sleep until then.
+    pub fn spawn(
+        overrides: SpawnOverrides<'_>,
+        wake: impl Fn() + Send + 'static,
+    ) -> io::Result<Self> {
         let config = SpawnConfig {
             cols: overrides.cols,
             rows: overrides.rows,
@@ -47,7 +54,7 @@ impl TerminalSession {
                 .then(|| overrides.working_directory.into()),
             ..SpawnConfig::default()
         };
-        let term = Terminal::spawn_with_config(&config)?;
+        let term = Terminal::spawn_notify(&config, wake)?;
         Ok(Self {
             term,
             last_version: 0,
@@ -59,6 +66,7 @@ impl TerminalSession {
             is_alt_screen: false,
             bracketed_paste: false,
             application_cursor_keys: false,
+            dropped: 0,
         })
     }
 
@@ -85,6 +93,7 @@ impl TerminalSession {
         self.is_alt_screen = snapshot.is_alt_screen;
         self.bracketed_paste = snapshot.bracketed_paste;
         self.application_cursor_keys = snapshot.application_cursor_keys;
+        self.dropped = snapshot.dropped;
         true
     }
 
@@ -117,6 +126,12 @@ impl TerminalSession {
     /// When true, clipboard pastes must be wrapped in ESC[200~ … ESC[201~.
     pub fn bracketed_paste_enabled(&self) -> bool {
         self.bracketed_paste
+    }
+
+    /// Lines dropped off the top of scrollback so far. With the scrollback
+    /// length it tells how many lines arrived, even at the cap.
+    pub fn dropped(&self) -> u64 {
+        self.dropped
     }
 
     /// Whether the app asked for application cursor keys (DECCKM): arrows

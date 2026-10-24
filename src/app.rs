@@ -13,7 +13,6 @@ use crate::input::{self, TextInputNormalizer};
 use crate::render::{self, CellMetrics, CellRowsView, RowFonts, SelectionRange};
 use crate::terminal::TerminalSession;
 
-const POLL_INTERVAL: Duration = Duration::from_millis(8);
 const FRAME_INTERVAL: Duration = Duration::from_micros(16_667); // 60 FPS render cap
 pub const DEFAULT_TITLE: &str = "Glacia";
 
@@ -154,15 +153,16 @@ impl App {
     /// Runs until the window closes or the shell exits.
     pub fn run(mut self, window: &Window, canvas: &mut Canvas) -> AureaResult<()> {
         loop {
-            // Input ends the wait at once; otherwise it lasts until the next
-            // frame is due, or a poll interval for new shell output.
+            // Input and shell output (the reader wakes the window) end the
+            // wait at once; otherwise it lasts until the next frame is due or
+            // the cursor's next blink, and with nothing coming, for good.
             let timeout = if self.needs_redraw {
-                FRAME_INTERVAL.saturating_sub(self.last_render.elapsed())
+                Some(FRAME_INTERVAL.saturating_sub(self.last_render.elapsed()))
             } else {
-                POLL_INTERVAL
+                self.next_blink()
             };
             let mut close = false;
-            for event in window.wait_events(Some(timeout)) {
+            for event in window.wait_events(timeout) {
                 close |= self.on_event(&event);
             }
             if close {
@@ -177,6 +177,17 @@ impl App {
                 self.draw(canvas)?;
             }
         }
+    }
+
+    /// How long until the cursor blinks next, or none when it doesn't.
+    fn next_blink(&self) -> Option<Duration> {
+        if !self.config.cursor.blink {
+            return None;
+        }
+        let blink = Duration::from_millis(self.config.cursor.blink_interval_ms);
+        let quiet = blink.saturating_sub(self.last_output.elapsed());
+        let flip = blink.saturating_sub(self.last_blink.elapsed());
+        Some(quiet.max(flip))
     }
 
     fn padding(&self) -> u32 {
@@ -395,10 +406,13 @@ impl App {
     fn pump_shell(&mut self, window: &Window) {
         let blink = Duration::from_millis(self.config.cursor.blink_interval_ms);
         let history = self.term.scrollback_rows().len();
+        let dropped = self.term.dropped();
         if self.term.sync() {
-            // scrolled back: stay on the same lines while new ones come in
+            // scrolled back: stay on the same lines while new ones come in;
+            // at the scrollback cap they show as dropped, not as growth
             if self.scroll_offset > 0 {
-                let grown = self.term.scrollback_rows().len().saturating_sub(history);
+                let gone = usize::try_from(self.term.dropped() - dropped).unwrap_or(usize::MAX);
+                let grown = (self.term.scrollback_rows().len() + gone).saturating_sub(history);
                 let max_scroll = self.term.scrollback_rows().len();
                 self.scroll_offset = (self.scroll_offset + grown).min(max_scroll);
             }
