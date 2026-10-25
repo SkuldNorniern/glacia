@@ -10,25 +10,15 @@ use vanta::{Cell, CellKind};
 
 use crate::config::Config;
 use crate::input::{self, TextInputNormalizer};
-use crate::render::{self, CellMetrics, CellRowsView, RowFonts, SelectionRange};
+use crate::render::{self, CellMetrics, CellRowsView, Layout, RowFonts, SelectionRange};
 use crate::terminal::TerminalSession;
 
 const FRAME_INTERVAL: Duration = Duration::from_micros(16_667); // 60 FPS render cap
 pub const DEFAULT_TITLE: &str = "Glacia";
 
 pub fn grid_size(width: u32, height: u32, metrics: &CellMetrics, padding: u32) -> (u16, u16) {
-    let w = width.saturating_sub(2 * padding) as f32;
-    let h = height.saturating_sub(2 * padding) as f32;
-    let cols = (w / metrics.width).max(1.0) as u16;
-    let rows = (h / metrics.height).max(1.0) as u16;
-    (cols, rows)
-}
-
-/// Convert a pixel position to a (row, col) cell index, clamping to the grid.
-fn px_to_cell(x: f64, y: f64, metrics: &CellMetrics, padding: f32) -> (usize, usize) {
-    let col = ((x as f32 - padding) / metrics.width).max(0.0) as usize;
-    let row = ((y as f32 - padding) / metrics.height).max(0.0) as usize;
-    (row, col)
+    let layout = Layout::new(width, height, metrics, padding);
+    (layout.cols as u16, layout.rows as u16)
 }
 
 /// Clipboard text made safe to paste: no paste-end marker that would let
@@ -103,6 +93,7 @@ pub struct App {
     fonts: RowFonts,
     diagnostics: Vec<String>,
     window_size: (u32, u32),
+    layout: Layout,
     text_input: TextInputNormalizer,
     /// Rows scrolled back into history; 0 is the live screen.
     scroll_offset: usize,
@@ -131,6 +122,12 @@ impl App {
         let now = Instant::now();
         Self {
             window_size: (config.window.width, config.window.height),
+            layout: Layout::new(
+                config.window.width,
+                config.window.height,
+                &metrics,
+                config.window.padding,
+            ),
             config,
             term,
             metrics,
@@ -196,8 +193,10 @@ impl App {
 
     fn resize_grid(&mut self, width: u32, height: u32) {
         self.window_size = (width, height);
-        let (cols, rows) = grid_size(width, height, &self.metrics, self.padding());
-        let _ = self.term.resize(cols, rows);
+        self.layout = Layout::new(width, height, &self.metrics, self.padding());
+        let _ = self
+            .term
+            .resize(self.layout.cols as u16, self.layout.rows as u16);
         self.needs_redraw = true;
     }
 
@@ -245,8 +244,7 @@ impl App {
                 ..
             } => self.on_left_button(*pressed, *x, *y),
             WindowEvent::MouseMove { x, y, .. } if self.mouse_dragging => {
-                let pad = self.padding() as f32;
-                let cell = px_to_cell(*x, *y, &self.metrics, pad);
+                let cell = self.layout.cell_at(*x, *y, &self.metrics);
                 // a selection starts once the pointer leaves the cell it
                 // was pressed in; a plain click selects nothing
                 if self.sel_end.is_some() || self.sel_anchor != Some(cell) {
@@ -268,7 +266,7 @@ impl App {
 
     fn on_left_button(&mut self, pressed: bool, x: f64, y: f64) {
         if pressed {
-            let cell = px_to_cell(x, y, &self.metrics, self.padding() as f32);
+            let cell = self.layout.cell_at(x, y, &self.metrics);
             self.sel_anchor = Some(cell);
             self.sel_end = None;
         }
@@ -452,14 +450,10 @@ impl App {
 
     /// Rows that fit inside the padding.
     fn visible_rows(&self) -> usize {
-        let padding = self.padding();
-        (self.window_size.1.saturating_sub(2 * padding) as f32 / self.metrics.height).max(1.0)
-            as usize
+        self.layout.rows
     }
 
     fn draw(&mut self, canvas: &mut Canvas) -> AureaResult<()> {
-        let padding = self.padding();
-        let pad = padding as f32;
         let visible_rows = self.visible_rows();
         let selection = self
             .sel_anchor
@@ -489,7 +483,7 @@ impl App {
                 &self.metrics,
                 &self.fonts,
                 &self.config.cursor.shape,
-                pad,
+                &self.layout,
                 selection,
             )?;
             if let Some(message) = self.diagnostics.first() {
@@ -529,10 +523,45 @@ mod tests {
     }
 
     #[test]
+    fn spare_room_is_split_evenly_around_the_grid() {
+        let layout = Layout::new(815, 415, &metrics(), 4);
+        assert_eq!((layout.cols, layout.rows), (80, 20));
+        // 7 px over on each axis: 3 more before, 4 more after
+        assert_eq!((layout.x, layout.y), (7.0, 7.0));
+        let tiny = CellMetrics {
+            width: 0.01,
+            height: 0.01,
+            ..metrics()
+        };
+        let huge = Layout::new(100_000, 100_000, &tiny, 0);
+        assert!(huge.cols <= 1000 && huge.rows <= 1000, "capped");
+    }
+
+    #[test]
     fn pixels_map_to_cells_past_the_padding() {
-        assert_eq!(px_to_cell(4.0, 4.0, &metrics(), 4.0), (0, 0));
-        assert_eq!(px_to_cell(35.0, 45.0, &metrics(), 4.0), (2, 3));
-        assert_eq!(px_to_cell(0.0, 0.0, &metrics(), 4.0), (0, 0), "clamped");
+        let layout = Layout::new(808, 408, &metrics(), 4);
+        assert_eq!(layout.cell_at(4.0, 4.0, &metrics()), (0, 0));
+        assert_eq!(layout.cell_at(35.0, 45.0, &metrics()), (2, 3));
+        assert_eq!(layout.cell_at(0.0, 0.0, &metrics()), (0, 0), "clamped");
+        assert_eq!(
+            layout.cell_at(5000.0, 5000.0, &metrics()),
+            (19, 79),
+            "clamped"
+        );
+    }
+
+    #[test]
+    fn snapped_cells_meet_with_no_gap() {
+        let m = CellMetrics {
+            width: 8.43,
+            ..metrics()
+        };
+        let layout = Layout::new(808, 408, &m, 4);
+        for col in 0..layout.cols {
+            let (a, b) = (layout.cell_x(col, &m), layout.cell_x(col + 1, &m));
+            assert_eq!(a, a.round());
+            assert!(b - a >= 8.0 && b - a <= 9.0);
+        }
     }
 
     #[test]

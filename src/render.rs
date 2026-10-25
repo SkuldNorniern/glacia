@@ -112,6 +112,55 @@ pub struct CellMetrics {
     pub ascent: f32,
 }
 
+/// most cells a side; a tiny font in a huge window can't ask for more.
+const MAX_CELLS: usize = 1000;
+
+/// where the grid sits in the window: whole cells only, and the space left
+/// past the last cell split evenly on both sides, so the margins match.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Layout {
+    /// left edge of column 0, whole pixels.
+    pub x: f32,
+    /// top edge of row 0, whole pixels.
+    pub y: f32,
+    pub cols: usize,
+    pub rows: usize,
+}
+
+impl Layout {
+    pub fn new(width: u32, height: u32, metrics: &CellMetrics, padding: u32) -> Self {
+        let room_w = width.saturating_sub(2 * padding) as f32;
+        let room_h = height.saturating_sub(2 * padding) as f32;
+        let cols = ((room_w / metrics.width) as usize).clamp(1, MAX_CELLS);
+        let rows = ((room_h / metrics.height) as usize).clamp(1, MAX_CELLS);
+        let spare_w = (room_w - cols as f32 * metrics.width).max(0.0);
+        let spare_h = (room_h - rows as f32 * metrics.height).max(0.0);
+        Self {
+            x: (padding as f32 + spare_w / 2.0).floor(),
+            y: (padding as f32 + spare_h / 2.0).floor(),
+            cols,
+            rows,
+        }
+    }
+
+    /// left edge of column `col`, snapped to a pixel so neighbouring cell
+    /// backgrounds meet with no seam or blur.
+    pub fn cell_x(&self, col: usize, metrics: &CellMetrics) -> f32 {
+        (self.x + col as f32 * metrics.width).round()
+    }
+
+    pub fn row_y(&self, row: usize, metrics: &CellMetrics) -> f32 {
+        self.y + row as f32 * metrics.height
+    }
+
+    /// the `(row, col)` under a window point, held inside the grid.
+    pub fn cell_at(&self, x: f64, y: f64, metrics: &CellMetrics) -> (usize, usize) {
+        let col = ((x as f32 - self.x) / metrics.width).max(0.0) as usize;
+        let row = ((y as f32 - self.y) / metrics.height).max(0.0) as usize;
+        (row.min(self.rows - 1), col.min(self.cols - 1))
+    }
+}
+
 /// Font set for one rendered frame: primary, bold, italic, bold-italic, and
 /// their fallback counterparts for CJK/emoji runs.
 ///
@@ -511,28 +560,21 @@ fn draw_row(
     baseline: f32,
     metrics: &CellMetrics,
     fonts: &RowFonts,
-    x_offset: f32,
+    layout: &Layout,
     sel_cols: Option<(usize, usize)>,
 ) -> AureaResult<()> {
+    let cx = |col: usize| layout.cell_x(col, metrics);
+    let cell_rect = |col: usize| Rect::new(cx(col), y_top, cx(col + 1) - cx(col), metrics.height);
     // Pass 1: row background + per-cell overrides.
     // Paint one rect covering the full row first so we never rely on a global
     // ctx.clear() — that "blank → draw" cycle is the primary cause of flicker.
     ctx.draw_rect(
-        Rect::new(
-            x_offset,
-            y_top,
-            row.len() as f32 * metrics.width,
-            metrics.height,
-        ),
+        Rect::new(cx(0), y_top, cx(row.len()) - cx(0), metrics.height),
         &solid(theme::BACKGROUND),
     )?;
     for (i, cell) in row.iter().enumerate() {
         if let (_, Some(bg)) = resolve_pair(cell) {
-            let x = i as f32 * metrics.width + x_offset;
-            ctx.draw_rect(
-                Rect::new(x, y_top, metrics.width, metrics.height),
-                &solid(bg),
-            )?;
+            ctx.draw_rect(cell_rect(i), &solid(bg))?;
         }
     }
 
@@ -542,11 +584,7 @@ fn draw_row(
             if i >= row.len() {
                 break;
             }
-            let x = i as f32 * metrics.width + x_offset;
-            ctx.draw_rect(
-                Rect::new(x, y_top, metrics.width, metrics.height),
-                &solid(theme::SELECTION),
-            )?;
+            ctx.draw_rect(cell_rect(i), &solid(theme::SELECTION))?;
         }
     }
 
@@ -589,7 +627,7 @@ fn draw_row(
             if text == raw {
                 i = start;
             } else {
-                let x = (start as f32 * metrics.width + x_offset).round();
+                let x = cx(start);
                 let font_slot = fonts.font_slot_for_chars(ctx, text.chars());
                 ctx.draw_text_with_font(
                     &text,
@@ -601,7 +639,7 @@ fn draw_row(
             }
         }
         if cell_uses_grid_origin(&row[i]) {
-            let x = (i as f32 * metrics.width + x_offset).round();
+            let x = cx(i);
             draw_cell_text(ctx, &row[i], x, baseline, fonts, fg)?;
             i += 1;
             continue;
@@ -634,7 +672,7 @@ fn draw_row(
         }
         // Round to the nearest pixel: Direct2D (Windows) produces crisper glyph
         // outlines when text origins land on integer device coordinates.
-        let x = (start as f32 * metrics.width + x_offset).round();
+        let x = cx(start);
         ctx.draw_text_with_font(
             &text,
             Point::new(x, baseline.round()),
@@ -647,17 +685,18 @@ fn draw_row(
     let ul_y = baseline + 2.0;
     let st_y = baseline - metrics.ascent * 0.35;
     for (i, cell) in row.iter().enumerate() {
-        let x = i as f32 * metrics.width + x_offset;
+        let x = cx(i);
+        let w = cx(i + 1) - x;
         if cell.attrs.contains(Attrs::UNDERLINE) {
             let ul_color = match cell.underline_color {
                 TermColor::Default => resolve_pair(cell).0,
                 other => theme::resolve(other, theme::FOREGROUND),
             };
-            ctx.draw_rect(Rect::new(x, ul_y, metrics.width, 1.5), &solid(ul_color))?;
+            ctx.draw_rect(Rect::new(x, ul_y, w, 1.5), &solid(ul_color))?;
         }
         if cell.attrs.contains(Attrs::STRIKE) {
             let (fg, _) = resolve_pair(cell);
-            ctx.draw_rect(Rect::new(x, st_y, metrics.width, 1.0), &solid(fg))?;
+            ctx.draw_rect(Rect::new(x, st_y, w, 1.0), &solid(fg))?;
         }
     }
 
@@ -665,7 +704,7 @@ fn draw_row(
 }
 
 /// Draw the full visible grid, then the cursor on top if `cursor_visible`.
-/// `padding` offsets every cell from the window edge.
+/// `layout` places the cells in the window.
 /// `selection` highlights the covered cells with the selection background.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_grid(
@@ -676,7 +715,7 @@ pub fn draw_grid(
     metrics: &CellMetrics,
     fonts: &RowFonts,
     cursor_shape: &CursorShape,
-    padding: f32,
+    layout: &Layout,
     selection: Option<SelectionRange>,
 ) -> AureaResult<()> {
     let line_h = metrics.height;
@@ -685,7 +724,7 @@ pub fn draw_grid(
         let Some(row) = rows.get(row_idx) else {
             continue;
         };
-        let y_top = row_idx as f32 * line_h + padding;
+        let y_top = layout.row_y(row_idx, metrics);
         let sel_cols = selection.and_then(|s| s.cols_for_row(row_idx, row.len()));
         draw_row(
             ctx,
@@ -694,7 +733,7 @@ pub fn draw_grid(
             y_top + metrics.baseline_offset,
             metrics,
             fonts,
-            padding,
+            layout,
             sel_cols,
         )?;
     }
@@ -704,9 +743,10 @@ pub fn draw_grid(
         if row < rows.len() {
             if let Some(cursor_row) = rows.get(row) {
                 let (cursor_col, cursor_width_cells) = cursor_cell_span(cursor_row, col);
-                let x = cursor_col as f32 * metrics.width + padding;
-                let y = row as f32 * line_h + padding;
-                let cursor_width = metrics.width * cursor_width_cells;
+                let x = layout.cell_x(cursor_col, metrics);
+                let y = layout.row_y(row, metrics);
+                let cursor_width =
+                    layout.cell_x(cursor_col + cursor_width_cells as usize, metrics) - x;
                 match cursor_shape {
                     CursorShape::Block => {
                         ctx.draw_rect(

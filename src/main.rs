@@ -48,10 +48,12 @@ fn cell_metrics(config: &Config, canvas: &Canvas, row_fonts: &mut RowFonts) -> C
         if let Ok(m) = ctx.measure_text("M", &row_fonts.primary) {
             if m.ascent > 0.0 {
                 let font_h = m.ascent + m.descent;
-                let leading = font_h * (config.font.line_height - 1.0);
-                // Centre the line_height gap evenly above and below the glyph.
-                metrics.baseline_offset = leading / 2.0 + m.ascent;
-                metrics.height = font_h + leading;
+                // whole-pixel rows: every row edge and baseline lands on a
+                // pixel, so lines stay sharp and evenly spaced
+                let height = (font_h * config.font.line_height).round().max(1.0);
+                // the line_height gap split evenly above and below the glyph
+                metrics.baseline_offset = ((height - font_h) / 2.0 + m.ascent).round();
+                metrics.height = height;
                 metrics.ascent = m.ascent;
             }
             if m.advance > 0.0 {
