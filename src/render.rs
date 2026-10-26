@@ -571,6 +571,7 @@ fn draw_row(
     let thick = metrics.underline_thickness.round().max(1.0);
     let ul_y = (baseline + metrics.underline_offset)
         .min(y_top + metrics.height - thick - 1.0)
+        .max(y_top)
         .round();
     let st_y = (baseline - metrics.strike_offset - thick / 2.0).round();
     for (i, cell) in row.iter().enumerate() {

@@ -44,7 +44,10 @@ fn cell_metrics(config: &Config, fonts: &RowFonts) -> CellMetrics {
     });
     let natural = face.ascent + face.descent + face.line_gap;
     let height = (natural * config.font.line_height).round().max(1.0);
-    let baseline_offset = ((height - face.ascent - face.descent) / 2.0 + face.ascent).round();
+    let baseline_offset = ((height - face.ascent - face.descent) / 2.0 + face.ascent)
+        .round()
+        .min(height - 1.0)
+        .max(1.0);
     let width = measure_text("M", &fonts.primary)
         .map(|m| m.advance)
         .ok()

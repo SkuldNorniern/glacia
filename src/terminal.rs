@@ -84,6 +84,11 @@ impl TerminalSession {
         &self.view.rows
     }
 
+    /// Whether row `row` on view runs on into the next (it wrapped).
+    pub fn wrapped(&self, row: usize) -> bool {
+        self.view.wrapped.get(row).copied().unwrap_or(false)
+    }
+
     /// The line number of the top row on view.
     pub fn first(&self) -> usize {
         self.view.first

@@ -6,11 +6,20 @@ use vanta::{Cell, CellKind};
 /// Schemes a plain url is spotted by; only web and mail links open.
 const SCHEMES: [&str; 3] = ["https://", "http://", "mailto:"];
 
+/// Whether a link goes somewhere glacia opens: web and mail only. An app's
+/// osc 8 link can name anything (`file:`, a custom handler) and is output
+/// nobody vetted, so the rest never count as links.
+fn opens(uri: &str) -> bool {
+    SCHEMES
+        .iter()
+        .any(|s| uri.len() > s.len() && uri[..s.len()].eq_ignore_ascii_case(s))
+}
+
 /// The link at `col` of `row`: its first and last column and where it
 /// goes.
 pub fn link_at(row: &[Cell], col: usize) -> Option<(usize, usize, String)> {
     let here = row.get(col)?;
-    if let Some(uri) = &here.hyperlink {
+    if let Some(uri) = here.hyperlink.as_ref().filter(|u| opens(u)) {
         // the run of cells the app gave the same link
         let same = |c: &Cell| c.hyperlink.as_ref() == Some(uri);
         let mut a = col;
@@ -133,5 +142,9 @@ mod tests {
         }
         assert_eq!(link_at(&r, 6), Some((5, 8, "https://docs.dev".into())));
         assert_eq!(link_at(&r, 2), None);
+        for cell in &mut r[5..9] {
+            cell.hyperlink = Some("file:///C:/evil.exe".into());
+        }
+        assert_eq!(link_at(&r, 6), None, "only web and mail links open");
     }
 }

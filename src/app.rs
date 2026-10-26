@@ -104,6 +104,9 @@ fn wheel_scrolls_up(delta_y: f64) -> bool {
     }
 }
 
+/// A piece of a link on one row: row, first and last column.
+type LinkPiece = (usize, usize, usize);
+
 /// Wakes the event loop from another thread.
 pub type Wake = Arc<dyn Fn() + Send + Sync>;
 
@@ -157,13 +160,11 @@ pub struct App {
     dragging: Option<Divider>,
     /// The link under the pointer while ctrl is held: row, first and last
     /// column, underlined to say a click opens it.
-    link_hover: Option<(usize, usize, usize)>,
+    link_hover: Vec<LinkPiece>,
     /// What the pointer is over on the tab bar.
     bar_hover: Option<BarHit>,
     /// A tab being dragged: its index, and where in it it was grabbed.
     tab_drag: Option<(usize, f32)>,
-    /// Where the tab was pressed: a press that never moved is a click.
-    tab_press: (f64, f64),
     /// The pane and side a dragged tab would join, shown as a preview.
     drop_zone: Option<(usize, Side)>,
     /// The pane with the keyboard fills its tab, the others hidden.
@@ -260,9 +261,8 @@ impl App {
             areas: Vec::new(),
             dragging: None,
             bar_hover: None,
-            link_hover: None,
+            link_hover: Vec::new(),
             tab_drag: None,
-            tab_press: (0.0, 0.0),
             drop_zone: None,
             zoomed: false,
             divider_hover: None,
@@ -458,6 +458,7 @@ impl App {
                 pane.scroll_offset = pane.scroll_offset.min(pane.term.scrollback_len());
             }
         }
+        self.link_hover.clear();
         // rewrapping moved the text the matches point at
         if let Some(search) = &mut self.search {
             search.stale = true;
@@ -511,6 +512,7 @@ impl App {
         self.reported_cell = None;
         self.mouse_dragging = false;
         self.preedit.clear();
+        self.link_hover.clear();
         self.term.sync(self.scroll_offset);
         self.retitle = true;
         self.wake_cursor();
@@ -581,6 +583,7 @@ impl App {
         self.zoomed = false;
         // the tree a held line points into is about to change
         self.dragging = None;
+        self.drop_zone = None;
         let Some(t) = self.tabs.iter().position(|(tree, _)| tree.contains(id)) else {
             return true;
         };
@@ -741,14 +744,42 @@ impl App {
 
     /// The link under a window point, in the pane with the keyboard: its
     /// row, first and last column, and where it goes.
-    fn link_at(&self, x: f64, y: f64) -> Option<(usize, usize, usize, String)> {
+    ///
+    /// Rows that wrapped are read as one line, so a url the terminal broke
+    /// across rows opens whole. The pieces come back one per row.
+    fn link_at(&self, x: f64, y: f64) -> Option<(Vec<LinkPiece>, String)> {
         if !self.layout.contains(x, y, &self.metrics) {
             return None;
         }
         let (row, col) = self.layout.cell_at(x, y, &self.metrics);
-        let cells = self.term.rows().get(row)?;
-        let (a, b, url) = links::link_at(cells, col)?;
-        Some((row, a, b, url))
+        let rows = self.term.rows();
+        rows.get(row)?;
+        // the logical line around the row, a few rows each way at most
+        let mut first = row;
+        while first > 0 && row - first < 8 && self.term.wrapped(first - 1) {
+            first -= 1;
+        }
+        let mut last = row;
+        while last + 1 < rows.len() && last - row < 8 && self.term.wrapped(last) {
+            last += 1;
+        }
+        let mut cells = Vec::new();
+        let mut starts = Vec::new();
+        for row_cells in &rows[first..=last] {
+            starts.push(cells.len());
+            cells.extend_from_slice(row_cells);
+        }
+        let at = starts[row - first] + col;
+        let (a, b, url) = links::link_at(&cells, at)?;
+        let pieces = (first..=last)
+            .zip(&starts)
+            .filter_map(|(r, &start)| {
+                let end = start + rows[r].len();
+                let (from, to) = (a.max(start), b.min(end.saturating_sub(1)));
+                (from <= to && from < end).then_some((r, from - start, to - start))
+            })
+            .collect();
+        Some((pieces, url))
     }
 
     /// The mouse cursor for where the pointer is: resize arrows on a line
@@ -763,7 +794,7 @@ impl App {
                 Dir::Down => CursorIcon::ResizeVertical,
             };
         }
-        if self.link_hover.is_some() {
+        if !self.link_hover.is_empty() {
             return CursorIcon::Pointer;
         }
         if self.tab_drag.is_some() || (y as f32) < self.bar_height() as f32 {
@@ -855,8 +886,17 @@ impl App {
         let Some((index, _)) = self.tab_drag.take() else {
             return;
         };
-        match self.drop_zone.take() {
-            Some((pane, side)) if index != self.active && index < self.tabs.len() => {
+        // the pane must still be on show: it may have closed mid drag
+        let zone = self
+            .drop_zone
+            .take()
+            .filter(|(pane, _)| self.areas.iter().any(|a| a.0 == *pane));
+        match zone {
+            Some((pane, side))
+                if index != self.active
+                    && index < self.tabs.len()
+                    && self.tabs[self.active].0.contains(pane) =>
+            {
                 let (tree, last) = self.tabs.remove(index);
                 if index < self.tab_x.len() {
                     self.tab_x.remove(index);
@@ -1009,6 +1049,11 @@ impl App {
             WindowEvent::Focused | WindowEvent::Unfocused => {
                 self.window_focused = matches!(event, WindowEvent::Focused);
                 if !self.window_focused {
+                    // a release outside may never come
+                    self.tab_drag = None;
+                    self.drop_zone = None;
+                    self.dragging = None;
+                    self.link_hover.clear();
                     // an input method may not say its composition ended
                     self.preedit.clear();
                 }
@@ -1035,7 +1080,6 @@ impl App {
                         // shown on release, so a tab can be dragged onto
                         // the one on show
                         self.tab_drag = Some((i, *x as f32 - bar.slot_x(i)));
-                        self.tab_press = (*x, *y);
                     }
                     // a second click of a double click lands on whatever slid
                     // under the pointer: only a fresh press closes or opens
@@ -1067,7 +1111,9 @@ impl App {
                 ..
             } if modifiers.ctrl && !modifiers.shift && self.link_at(*x, *y).is_some() => {
                 // ctrl+click opens a link, before the app or a selection
-                if let Some((_, _, _, url)) = self.link_at(*x, *y) {
+                // in an app that takes the mouse this press never reaches it;
+                // ctrl+click is glacia's
+                if let Some((_, url)) = self.link_at(*x, *y) {
                     let _ = open_url(&url);
                 }
             }
@@ -1158,7 +1204,8 @@ impl App {
                     .ctrl
                     .then(|| self.link_at(*x, *y))
                     .flatten()
-                    .map(|(row, a, b, _)| (row, a, b));
+                    .map(|(pieces, _)| pieces)
+                    .unwrap_or_default();
                 if link != self.link_hover {
                     self.link_hover = link;
                     self.needs_redraw = true;
@@ -1187,7 +1234,7 @@ impl App {
                 }
             }
             WindowEvent::KeyInput { modifiers, .. }
-                if !modifiers.ctrl && self.link_hover.take().is_some() =>
+                if !modifiers.ctrl && !take(&mut self.link_hover).is_empty() =>
             {
                 self.needs_redraw = true;
                 if let WindowEvent::KeyInput {
@@ -1549,6 +1596,7 @@ impl App {
     }
 
     fn on_wheel(&mut self, delta_y: f64, mods: Modifiers) {
+        self.link_hover.clear();
         // over another pane: not this one's to scroll
         let (px, py) = self.pointer;
         if self.pane_at(px, py).is_some_and(|id| id != self.focused) {
@@ -1637,6 +1685,8 @@ impl App {
         let blink = Duration::from_millis(self.config.cursor.blink_interval_ms);
         if follow(&mut self.term, &mut self.scroll_offset) {
             self.retitle = true;
+            // the text under a link underline moved
+            self.link_hover.clear();
             if let Some(search) = &mut self.search {
                 search.stale = true;
             }
@@ -1959,19 +2009,17 @@ impl App {
                 }
                 caret = Some(Rect::new(x, y, self.metrics.width, self.metrics.height));
             }
-            if let Some((row, a, b)) = self.link_hover {
+            for &(row, a, b) in &self.link_hover {
                 let x = self.layout.cell_x(a, &self.metrics);
                 let w = self.layout.cell_x(b + 1, &self.metrics) - x;
-                let y = self.layout.row_y(row, &self.metrics)
-                    + self.metrics.baseline_offset
-                    + self.metrics.underline_offset;
+                let thick = self.metrics.underline_thickness.round().max(1.0);
+                let top = self.layout.row_y(row, &self.metrics);
+                // under the baseline, never into the next row
+                let y = (top + self.metrics.baseline_offset + self.metrics.underline_offset)
+                    .min(top + self.metrics.height - thick)
+                    .max(top);
                 ctx.draw_rect(
-                    Rect::new(
-                        x,
-                        y.round(),
-                        w,
-                        self.metrics.underline_thickness.round().max(1.0),
-                    ),
+                    Rect::new(x, y.round(), w, thick),
                     &solid(theme::FOUND_CURRENT),
                 )?;
             }
