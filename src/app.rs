@@ -129,6 +129,9 @@ fn follow(term: &mut TerminalSession, scroll: &mut usize) -> bool {
     true
 }
 
+/// How often a shell whose output ended is checked for its exit.
+const REAP_EVERY: Duration = Duration::from_millis(50);
+
 /// Widest a tab is drawn.
 const TAB_MAX: f32 = 220.0;
 /// The line between split panes.
@@ -260,6 +263,13 @@ impl App {
                 Some(FRAME_INTERVAL.saturating_sub(self.last_render.elapsed()))
             } else {
                 self.next_blink()
+            };
+            // a shell whose output ended but isn't reaped yet: look again soon
+            let dying = self.term.closed() || self.panes.iter().flatten().any(|p| p.term.closed());
+            let timeout = if dying {
+                Some(timeout.map_or(REAP_EVERY, |t| t.min(REAP_EVERY)))
+            } else {
+                timeout
             };
             // matches behind new output are looked for again, on a timer
             let timeout = match self
@@ -455,6 +465,11 @@ impl App {
 
     /// Splits the pane with the keyboard; the new one gets it.
     fn split(&mut self, dir: Dir) {
+        // too small to hold two usable panes
+        let (cols, rows) = (self.layout.cols, self.layout.rows);
+        if (dir == Dir::Right && cols < 20) || (dir == Dir::Down && rows < 6) {
+            return;
+        }
         let Some(id) = self.spawn_pane() else {
             return;
         };
@@ -503,6 +518,10 @@ impl App {
         if let Some(slot) = self.panes.get_mut(id) {
             *slot = None;
         }
+        // free slots at the end go; ids before them stay as they are
+        while self.panes.len() > self.focused + 1 && matches!(self.panes.last(), Some(None)) {
+            self.panes.pop();
+        }
         self.refit();
         true
     }
@@ -544,8 +563,13 @@ impl App {
                     Event::Clipboard(_) => {}
                 }
             }
-            // output ends when the shell exits: only then is it worth asking
-            if !pane.term.is_running() {
+        }
+        // a shell whose output ended: asked every pass until it is reaped
+        for (id, slot) in self.panes.iter().enumerate() {
+            if let Some(pane) = slot
+                && pane.term.closed()
+                && !pane.term.is_running()
+            {
                 gone.push(id);
             }
         }
@@ -754,7 +778,10 @@ impl App {
                 self.pointer = (*x, *y);
                 if self.mouse_dragging {
                     self.on_drag(*x, *y);
-                } else if self.reported != 0 || self.app_takes_mouse(*modifiers) {
+                } else if self.reported != 0
+                    || (self.app_takes_mouse(*modifiers)
+                        && self.layout.contains(*x, *y, &self.metrics))
+                {
                     // motion carries the lowest button held, or none
                     let button = (0..3)
                         .find(|b| self.reported & (1 << b) != 0)
@@ -825,9 +852,10 @@ impl App {
     }
 
     fn on_drag(&mut self, x: f64, y: f64) {
-        // past the top or bottom edge the view scrolls along
-        let top = self.layout.y as f64;
-        let bottom = top + self.layout.rows as f64 * self.metrics.height as f64;
+        // past the window's top or bottom the view scrolls along; into a
+        // pane above or below, the selection just stops at the edge
+        let top = self.bar_height() as f64;
+        let bottom = self.window_size.1 as f64;
         if !self.term.is_alt_screen() {
             if y < top {
                 self.scroll_offset = (self.scroll_offset + 1).min(self.term.scrollback_len());
@@ -950,6 +978,7 @@ impl App {
         if let Some(search) = &mut self.search {
             search.stale = true;
             search.jump = true;
+            search.query_gen += 1;
         }
         self.poll_search();
     }
@@ -962,6 +991,10 @@ impl App {
         };
         if let Some(rx) = &search.pending {
             match rx.try_recv() {
+                Ok(_) if search.pending_gen != search.query_gen => {
+                    // for a query since typed over; its own search is next
+                    search.pending = None;
+                }
                 Ok((dropped, found)) => {
                     search.pending = None;
                     search.set_found(dropped, &found);
@@ -974,6 +1007,7 @@ impl App {
                 Err(TryRecvError::Empty) => return,
                 Err(TryRecvError::Disconnected) => {
                     search.pending = None;
+                    search.stale = true;
                 }
             }
         }
@@ -984,6 +1018,7 @@ impl App {
             search.stale = false;
             let (tx, rx) = channel();
             search.pending = Some(rx);
+            search.pending_gen = search.query_gen;
             let wake = Arc::clone(&self.wake);
             self.term
                 .find_in_background(search.query.clone(), move |found| {
@@ -1080,6 +1115,11 @@ impl App {
     }
 
     fn on_wheel(&mut self, delta_y: f64, mods: Modifiers) {
+        // over another pane: not this one's to scroll
+        let (px, py) = self.pointer;
+        if self.pane_at(px, py).is_some_and(|id| id != self.focused) {
+            return;
+        }
         let up = wheel_scrolls_up(delta_y);
         let lines = (delta_y.abs() * 3.0).ceil() as usize;
         if self.app_takes_mouse(mods) {
@@ -1359,7 +1399,11 @@ impl App {
                     ctx,
                     &search.query,
                     search.count(),
-                    (self.window_size.0 as f32, bar),
+                    // the focused pane's top right
+                    self.areas
+                        .iter()
+                        .find(|a| a.0 == self.focused)
+                        .map_or((self.window_size.0 as f32, bar), |a| (a.1.0 + a.1.2, a.1.1)),
                     &self.metrics,
                     &self.fonts,
                     &self.colors,

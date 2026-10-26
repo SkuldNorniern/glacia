@@ -903,15 +903,15 @@ pub fn draw_find_bar(
     ctx: &mut dyn DrawingContext,
     query: &str,
     (current, total): (usize, usize),
-    (window_width, top): (f32, f32),
+    (right, top): (f32, f32),
     metrics: &CellMetrics,
     fonts: &RowFonts,
     colors: &Colors,
 ) -> AureaResult<()> {
     let pad = 8.0;
     let h = metrics.height + 2.0 * pad;
-    let w = (metrics.width * 36.0).min(window_width - 16.0).max(120.0);
-    let x = (window_width - w - 8.0).round();
+    let w = (metrics.width * 36.0).min(right - 16.0).max(120.0);
+    let x = (right - w - 8.0).round();
     let y = top + 8.0;
     ctx.draw_shadow(Rect::new(x, y, w, h), 6.0, 10.0, Color::rgba(0, 0, 0, 90))?;
     ctx.draw_round_rect(Rect::new(x, y, w, h), 6.0, &solid(theme::BAR))?;

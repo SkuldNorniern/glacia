@@ -232,12 +232,21 @@ impl TerminalSession {
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) -> io::Result<()> {
+        // the same size again would rewrap and tell the app for nothing
+        if (cols as usize, rows as usize) == (self.screen_cols, self.screen_rows) {
+            return Ok(());
+        }
         self.screen_cols = cols as usize;
         self.screen_rows = rows as usize;
         let result = self.term.resize(cols, rows);
         self.view = self.term.view(self.back, self.screen_rows);
         self.last_version = self.view.version;
         result
+    }
+
+    /// The shell's output ended: it exited, or is about to.
+    pub fn closed(&self) -> bool {
+        self.term.is_closed()
     }
 
     pub fn is_running(&self) -> bool {

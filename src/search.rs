@@ -23,6 +23,10 @@ pub struct Search {
     /// Show the current match once the results are in (the query changed).
     pub jump: bool,
     pub done_at: Instant,
+    /// Bumped when the query changes, and what the running search was
+    /// started for: results for an older query are dropped.
+    pub query_gen: u64,
+    pub pending_gen: u64,
 }
 
 impl Default for Search {
@@ -35,6 +39,8 @@ impl Default for Search {
             stale: false,
             jump: false,
             done_at: Instant::now(),
+            query_gen: 0,
+            pending_gen: 0,
         }
     }
 }
