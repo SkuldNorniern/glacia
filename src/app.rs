@@ -3,19 +3,20 @@
 
 use std::time::{Duration, Instant};
 
-use aurea::render::Canvas;
+use aurea::render::{Canvas, Point, Rect};
 use aurea::{AureaResult, KeyCode, Modifiers, MouseButton, Window, WindowEvent};
 use aurea::{clipboard_text, set_clipboard_text};
 
 use vanta::{Cell, CursorStyle, Event, MouseTracking};
 
-use crate::config::{Config, CursorShape};
+use crate::config::{Config, CursorShape, MAX_FONT_SIZE, MIN_FONT_SIZE};
 use crate::input::{self, TextInputNormalizer};
 use crate::mouse::{self, Kind};
 use crate::render::{self, CellMetrics, Layout, RowFonts, SelectionRange};
 use crate::selection::{Selection, Spot, Unit};
 use crate::terminal::TerminalSession;
 use crate::theme::Colors;
+use crate::{cell_metrics, row_fonts};
 
 const FRAME_INTERVAL: Duration = Duration::from_micros(16_667); // 60 FPS render cap
 pub const DEFAULT_TITLE: &str = "Glacia";
@@ -85,6 +86,14 @@ pub struct App {
     /// What the frame draws with, and the vanta palette version it is from.
     colors: Colors,
     palette_version: u64,
+    /// The configured font size, for ctrl+0, and a new one a zoom key
+    /// asked for, applied once the loop has the canvas to measure with.
+    base_font_size: f32,
+    zoom_to: Option<f32>,
+    /// What an input method is still composing, drawn at the cursor.
+    preedit: String,
+    /// Where the cursor was drawn, for the input method's candidate window.
+    caret: Option<Rect>,
     cursor_visible: bool,
     last_blink: Instant,
     /// When output last arrived; the cursor holds still until the shell has
@@ -106,6 +115,7 @@ impl App {
         let now = Instant::now();
         Self {
             window_size: (config.window.width, config.window.height),
+            base_font_size: config.font.size,
             layout: Layout::new(
                 config.window.width,
                 config.window.height,
@@ -127,6 +137,9 @@ impl App {
             focused: true,
             colors: Colors::theme(),
             palette_version: 0,
+            zoom_to: None,
+            preedit: String::new(),
+            caret: None,
             cursor_visible: true,
             last_blink: now,
             last_output: now,
@@ -162,6 +175,9 @@ impl App {
             if close {
                 return Ok(());
             }
+            if let Some(size) = self.zoom_to.take() {
+                self.set_font_size(size, canvas);
+            }
             self.follow_canvas_size(canvas);
             self.pump_shell(window);
             if !self.term.is_running() {
@@ -169,6 +185,9 @@ impl App {
             }
             if self.needs_redraw && self.last_render.elapsed() >= FRAME_INTERVAL {
                 self.draw(canvas)?;
+                if let Some(caret) = self.caret {
+                    let _ = window.set_ime_cursor_area(caret);
+                }
             }
         }
     }
@@ -323,7 +342,14 @@ impl App {
             WindowEvent::MouseWheel {
                 delta_y, modifiers, ..
             } => self.on_wheel(*delta_y, *modifiers),
-            WindowEvent::TextInput { text } => self.on_text(text),
+            WindowEvent::TextInput { text } => {
+                self.preedit.clear();
+                self.on_text(text);
+            }
+            WindowEvent::ImePreedit { text, .. } if *text != self.preedit => {
+                text.clone_into(&mut self.preedit);
+                self.needs_redraw = true;
+            }
             _ => {}
         }
         false
@@ -394,7 +420,16 @@ impl App {
 
     fn on_key(&mut self, key: KeyCode, modifiers: Modifiers) {
         let copy_paste = modifiers.ctrl && modifiers.shift;
-        if copy_paste && key == KeyCode::C {
+        let zoom = modifiers.ctrl && !modifiers.shift && !modifiers.alt;
+        let size = self.config.font.size;
+        if zoom && matches!(key, KeyCode::Equals | KeyCode::Minus | KeyCode::Key0) {
+            let next = match key {
+                KeyCode::Equals => size + 1.0,
+                KeyCode::Minus => size - 1.0,
+                _ => self.base_font_size,
+            };
+            self.zoom_to = Some(next.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE));
+        } else if copy_paste && key == KeyCode::C {
             self.copy_selection();
         } else if copy_paste && key == KeyCode::V {
             self.paste();
@@ -583,6 +618,19 @@ impl App {
         }
     }
 
+    /// Remeasures the cells for a new font size and refits the grid.
+    fn set_font_size(&mut self, size: f32, canvas: &Canvas) {
+        if size == self.config.font.size {
+            return;
+        }
+        self.config.font.size = size;
+        self.fonts = row_fonts(&self.config);
+        self.metrics = cell_metrics(&self.config, canvas, &mut self.fonts);
+        let (w, h) = self.window_size;
+        self.resize_grid(w, h);
+        self.clear_selection();
+    }
+
     /// Clipboard writes from apps (OSC 52: yank in a remote vim lands
     /// here) when the config allows them.
     fn take_events(&mut self) {
@@ -651,6 +699,7 @@ impl App {
         // `canvas.draw()` invalidates the native surface itself; an extra
         // `invalidate_all()` would repaint again through the background-only
         // draw callback and wipe this frame.
+        let mut caret = None;
         // the margins follow an app that changed the background
         canvas.set_background_color(self.colors.background);
         canvas.draw(|ctx| {
@@ -665,6 +714,21 @@ impl App {
                 selection,
                 &self.colors,
             )?;
+            if let Some((row, col)) = self.term.cursor() {
+                let x = self.layout.cell_x(col, &self.metrics);
+                let y = self.layout.row_y(row, &self.metrics);
+                if !self.preedit.is_empty() {
+                    render::draw_preedit(
+                        ctx,
+                        &self.preedit,
+                        Point::new(x, y),
+                        &self.metrics,
+                        &self.fonts,
+                        &self.colors,
+                    )?;
+                }
+                caret = Some(Rect::new(x, y, self.metrics.width, self.metrics.height));
+            }
             if let Some(message) = self.diagnostics.first() {
                 render::draw_diagnostics_banner(
                     ctx,
@@ -676,6 +740,7 @@ impl App {
             }
             Ok(())
         })?;
+        self.caret = caret;
         self.needs_redraw = false;
         self.last_render = Instant::now();
         Ok(())

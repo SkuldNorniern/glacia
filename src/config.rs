@@ -31,6 +31,10 @@ impl Default for WindowConfig {
     }
 }
 
+/// Font sizes the config and zoom keep to.
+pub const MIN_FONT_SIZE: f32 = 6.0;
+pub const MAX_FONT_SIZE: f32 = 96.0;
+
 #[derive(Debug, Clone)]
 pub struct FontConfig {
     pub family: String,
@@ -190,14 +194,14 @@ impl Config {
                 config.font.fallbacks = parse_font_fallbacks(v);
             }
             if let Some(v) = as_f32(font.get("size"))
-                && v > 0.0
+                && v.is_finite()
             {
-                config.font.size = v;
+                config.font.size = v.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
             }
             if let Some(v) = as_f32(font.get("line_height"))
-                && v > 0.0
+                && v.is_finite()
             {
-                config.font.line_height = v;
+                config.font.line_height = v.clamp(0.8, 3.0);
             }
         }
 

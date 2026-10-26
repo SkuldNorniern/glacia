@@ -5,7 +5,8 @@ use std::collections::HashMap;
 
 use aurea::AureaResult;
 use aurea::render::{
-    Color, DrawingContext, Font, FontStyle, FontWeight, Paint, PaintStyle, Point, Rect,
+    Color, DrawingContext, Font, FontStyle, FontWeight, LineJoin, Paint, PaintStyle, Path,
+    PathCommand, Point, Rect,
 };
 use vanta::Color as TermColor;
 use vanta::vt::Attrs;
@@ -632,7 +633,8 @@ fn draw_row(
     }
 
     // Pass 4: underlines and strikethroughs
-    let ul_y = baseline + 2.0;
+    // under the baseline, never past the bottom of the row
+    let ul_y = (baseline + 2.0).min(y_top + metrics.height - 3.0).round();
     let st_y = baseline - metrics.ascent * 0.35;
     for (i, cell) in row.iter().enumerate() {
         let x = cx(i);
@@ -642,7 +644,7 @@ fn draw_row(
                 TermColor::Default => resolve_pair(cell, colors).0,
                 other => colors.resolve(other, colors.foreground),
             };
-            ctx.draw_rect(Rect::new(x, ul_y, w, 1.5), &solid(ul_color))?;
+            draw_underline(ctx, cell.attrs, x, ul_y, w, ul_color)?;
         }
         if cell.attrs.contains(Attrs::STRIKE) {
             let (fg, _) = resolve_pair(cell, colors);
@@ -651,6 +653,51 @@ fn draw_row(
     }
 
     Ok(())
+}
+
+/// One cell's underline in the shape SGR `4:n` asked for. A curly one is
+/// a full wave per cell, so neighbours join into one line.
+fn draw_underline(
+    ctx: &mut dyn DrawingContext,
+    attrs: Attrs,
+    x: f32,
+    y: f32,
+    w: f32,
+    color: Color,
+) -> AureaResult<()> {
+    let paint = solid(color);
+    if attrs.contains(Attrs::CURLY_UNDERLINE) {
+        let a = 1.5;
+        let mut path = Path::new();
+        path.commands.push(PathCommand::MoveTo(Point::new(x, y)));
+        for (dx, dy) in [(0.25, -a), (0.5, 0.0), (0.75, a), (1.0, 0.0)] {
+            path.commands
+                .push(PathCommand::LineTo(Point::new(x + w * dx, y + dy)));
+        }
+        let stroke = Paint {
+            color,
+            style: PaintStyle::Stroke,
+            stroke_width: 1.2,
+            line_join: LineJoin::Round,
+            ..Default::default()
+        };
+        ctx.draw_path(&path, &stroke)
+    } else if attrs.contains(Attrs::DOUBLE_UNDERLINE) {
+        ctx.draw_rect(Rect::new(x, y - 1.0, w, 1.0), &paint)?;
+        ctx.draw_rect(Rect::new(x, y + 1.0, w, 1.0), &paint)
+    } else if attrs.contains(Attrs::DOTTED_UNDERLINE) {
+        let mut dot = x;
+        while dot < x + w {
+            ctx.draw_rect(Rect::new(dot, y, 1.0, 1.0), &paint)?;
+            dot += 2.0;
+        }
+        Ok(())
+    } else if attrs.contains(Attrs::DASHED_UNDERLINE) {
+        ctx.draw_rect(Rect::new(x, y, w * 0.4, 1.0), &paint)?;
+        ctx.draw_rect(Rect::new(x + w * 0.5, y, w * 0.4, 1.0), &paint)
+    } else {
+        ctx.draw_rect(Rect::new(x, y, w, 1.0), &paint)
+    }
 }
 
 /// Draw the full visible grid, then the cursor on top if `cursor_visible`.
@@ -738,6 +785,38 @@ pub fn draw_grid(
     }
 
     Ok(())
+}
+
+/// Text an input method is still composing, over the cells at `at`:
+/// on the background, underlined, so it reads as not typed yet.
+pub fn draw_preedit(
+    ctx: &mut dyn DrawingContext,
+    text: &str,
+    at: Point,
+    metrics: &CellMetrics,
+    fonts: &RowFonts,
+    colors: &Colors,
+) -> AureaResult<()> {
+    let slot = fonts.font_slot_for_chars(ctx, text.chars());
+    let font = fonts.pick(false, false, slot);
+    let width = ctx
+        .measure_text(text, font)
+        .map_or(metrics.width, |m| m.advance)
+        .max(metrics.width);
+    ctx.draw_rect(
+        Rect::new(at.x, at.y, width, metrics.height),
+        &solid(colors.background),
+    )?;
+    ctx.draw_text_with_font(
+        text,
+        Point::new(at.x.round(), (at.y + metrics.baseline_offset).round()),
+        font,
+        &solid(colors.foreground),
+    )?;
+    ctx.draw_rect(
+        Rect::new(at.x, at.y + metrics.height - 2.0, width, 1.0),
+        &solid(colors.foreground),
+    )
 }
 
 /// Draw a one-line diagnostics banner pinned to the bottom of the window —

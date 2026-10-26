@@ -49,6 +49,9 @@ pub fn terminal_key_bytes(key: KeyCode, mods: Modifiers, app_cursor: bool) -> Op
         KeyCode::Tab => "\t".to_owned(),
         KeyCode::Escape => "\x1b".to_owned(),
         KeyCode::Space if mods.ctrl => "\0".to_owned(),
+        _ if mods.ctrl && control_punct(key, mods.shift).is_some() => {
+            control_punct(key, mods.shift)?.to_string()
+        }
         _ => {
             let c = letter(key)?;
             if mods.ctrl {
@@ -111,6 +114,22 @@ fn f1_to_f4(key: KeyCode) -> Option<char> {
         KeyCode::F2 => 'Q',
         KeyCode::F3 => 'R',
         KeyCode::F4 => 'S',
+        _ => return None,
+    })
+}
+
+/// Ctrl with a punctuation key: `^[` `^\` `^]` `^^` `^_` and `^@`, the way
+/// xterm sends them on a US layout.
+fn control_punct(key: KeyCode, shift: bool) -> Option<char> {
+    Some(match key {
+        KeyCode::LeftBracket => '\x1b',
+        KeyCode::Backslash => '\x1c',
+        KeyCode::RightBracket => '\x1d',
+        KeyCode::Key6 => '\x1e',
+        KeyCode::Slash => '\x1f',
+        // ctrl+minus alone is zoom; with shift it is `^_`, emacs's undo
+        KeyCode::Minus if shift => '\x1f',
+        KeyCode::Key2 => '\0',
         _ => return None,
     })
 }
@@ -284,5 +303,24 @@ mod tests {
         let mut normalizer = TextInputNormalizer::new();
         assert_eq!(normalizer.normalize("\u{1100}"), "");
         assert_eq!(normalizer.flush(), "\u{1100}");
+    }
+
+    #[test]
+    fn ctrl_punctuation_sends_control_codes() {
+        let ctrl = Modifiers {
+            ctrl: true,
+            ..Modifiers::default()
+        };
+        let key = |k| terminal_key_bytes(k, ctrl, false);
+        assert_eq!(key(KeyCode::LeftBracket).as_deref(), Some("\x1b"));
+        assert_eq!(key(KeyCode::Backslash).as_deref(), Some("\x1c"));
+        assert_eq!(key(KeyCode::RightBracket).as_deref(), Some("\x1d"));
+        assert_eq!(key(KeyCode::Slash).as_deref(), Some("\x1f"));
+        assert_eq!(key(KeyCode::Minus), None, "zoom");
+        let alt = Modifiers { alt: true, ..ctrl };
+        assert_eq!(
+            terminal_key_bytes(KeyCode::RightBracket, alt, false).as_deref(),
+            Some("\x1b\x1d")
+        );
     }
 }
