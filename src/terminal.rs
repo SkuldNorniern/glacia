@@ -115,7 +115,7 @@ impl TerminalSession {
         for (i, row) in window.rows.iter().enumerate() {
             let from = if i == 0 { start_col } else { 0 };
             let to = if i + 1 == count {
-                end_col + 1
+                end_col.saturating_add(1)
             } else {
                 usize::MAX
             };

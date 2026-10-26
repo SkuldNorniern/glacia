@@ -78,10 +78,10 @@ pub struct App {
     mouse_dragging: bool,
     /// The button an app is told is down, while it is, and the cell the
     /// last report named, so motion is only told when it changes cell.
-    reported: Option<u8>,
+    reported: u8,
     reported_cell: Option<(usize, usize)>,
-    /// The `(row, col)` under the pointer, for wheel reports.
-    pointer: (usize, usize),
+    /// Where the pointer is, in window pixels, for wheel reports.
+    pointer: (f64, f64),
     focused: bool,
     /// What the frame draws with, and the vanta palette version it is from.
     colors: Colors,
@@ -131,9 +131,9 @@ impl App {
             scroll_offset: 0,
             selection: None,
             mouse_dragging: false,
-            reported: None,
+            reported: 0,
             reported_cell: None,
-            pointer: (0, 0),
+            pointer: (0.0, 0.0),
             focused: true,
             colors: Colors::theme(),
             palette_version: 0,
@@ -213,6 +213,8 @@ impl App {
         let _ = self
             .term
             .resize(self.layout.cols as u16, self.layout.rows as u16);
+        // rewrapping can shrink scrollback under the view
+        self.scroll_offset = self.scroll_offset.min(self.term.scrollback_len());
         self.needs_redraw = true;
     }
 
@@ -245,7 +247,7 @@ impl App {
             ((start - top) as usize, start_col)
         };
         let to = if end >= bottom {
-            (self.term.rows().len() - 1, usize::MAX)
+            (self.term.rows().len().checked_sub(1)?, usize::MAX)
         } else {
             ((end - top) as usize, end_col)
         };
@@ -285,6 +287,10 @@ impl App {
             WindowEvent::ScaleFactorChanged { .. } => self.needs_redraw = true,
             WindowEvent::Focused | WindowEvent::Unfocused => {
                 self.focused = matches!(event, WindowEvent::Focused);
+                if !self.focused {
+                    // an input method may not say its composition ended
+                    self.preedit.clear();
+                }
                 if self.term.focus_tracking() {
                     let _ = self
                         .term
@@ -309,28 +315,40 @@ impl App {
                 };
                 let kind = if *pressed { Kind::Press } else { Kind::Release };
                 let told = code.is_some_and(|code| {
-                    // a release goes where its press went
+                    let bit = 1 << code;
+                    // a release goes where its press went; a press in the
+                    // margin hits no cell
                     let to_app = if *pressed {
                         self.app_takes_mouse(*modifiers)
+                            && self.layout.contains(*x, *y, &self.metrics)
                     } else {
-                        self.reported.is_some()
+                        self.reported & bit != 0
                     };
-                    to_app && self.report_mouse(code, kind, *modifiers, *x, *y)
+                    let told = to_app && self.report_mouse(code, kind, *modifiers, *x, *y);
+                    if told && *pressed {
+                        self.reported |= bit;
+                    } else if !*pressed {
+                        self.reported &= !bit;
+                    }
+                    told
                 });
-                if told {
-                    self.reported = (*pressed).then_some(code).flatten();
-                } else if *button == MouseButton::Left {
+                // a drag selection always ends on its release
+                let ends_drag = !*pressed && self.mouse_dragging;
+                if *button == MouseButton::Left && (!told || ends_drag) {
                     self.on_left_button(*pressed, *x, *y, *click_count);
                 }
             }
             WindowEvent::MouseMove {
                 x, y, modifiers, ..
             } => {
-                self.pointer = self.layout.cell_at(*x, *y, &self.metrics);
+                self.pointer = (*x, *y);
                 if self.mouse_dragging {
                     self.on_drag(*x, *y);
-                } else if self.reported.is_some() || self.app_takes_mouse(*modifiers) {
-                    let button = self.reported.unwrap_or(mouse::NONE);
+                } else if self.reported != 0 || self.app_takes_mouse(*modifiers) {
+                    // motion carries the lowest button held, or none
+                    let button = (0..3)
+                        .find(|b| self.reported & (1 << b) != 0)
+                        .unwrap_or(mouse::NONE);
                     self.report_mouse(button, Kind::Motion, *modifiers, *x, *y);
                 }
             }
@@ -358,14 +376,15 @@ impl App {
     /// Whether mouse input goes to the app: it asked for it and shift,
     /// which always selects instead, isn't held.
     fn app_takes_mouse(&self, mods: Modifiers) -> bool {
-        self.term.mouse().0 != MouseTracking::Off && !mods.shift
+        // scrolled back, the rows on view aren't the app's: select instead
+        self.term.mouse().0 != MouseTracking::Off && !mods.shift && self.scroll_offset == 0
     }
 
     /// Tells the app about the mouse when its mode wants this. True when
     /// the app took it.
     fn report_mouse(&mut self, button: u8, kind: Kind, mods: Modifiers, x: f64, y: f64) -> bool {
         let (tracking, protocol) = self.term.mouse();
-        if !mouse::wanted(tracking, kind, self.reported.is_some()) {
+        if !mouse::wanted(tracking, kind, self.reported != 0) {
             return tracking != MouseTracking::Off && kind == Kind::Motion;
         }
         let (row, col) = self.layout.cell_at(x, y, &self.metrics);
@@ -405,8 +424,8 @@ impl App {
             } else if y >= bottom {
                 self.scroll_offset = self.scroll_offset.saturating_sub(1);
             }
-            self.term.sync(self.scroll_offset);
         }
+        // the view catches up with the offset in `pump_shell`
         let (spot, cells) = self.spot_at(x, y);
         let cells = cells.to_vec();
         if let Some(sel) = &mut self.selection {
@@ -421,7 +440,8 @@ impl App {
     fn on_key(&mut self, key: KeyCode, modifiers: Modifiers) {
         let copy_paste = modifiers.ctrl && modifiers.shift;
         let zoom = modifiers.ctrl && !modifiers.shift && !modifiers.alt;
-        let size = self.config.font.size;
+        // two presses before the loop applies the first add up
+        let size = self.zoom_to.unwrap_or(self.config.font.size);
         if zoom && matches!(key, KeyCode::Equals | KeyCode::Minus | KeyCode::Key0) {
             let next = match key {
                 KeyCode::Equals => size + 1.0,
@@ -519,7 +539,9 @@ impl App {
             } else {
                 mouse::WHEEL_DOWN
             };
-            let at = self.pointer;
+            let at = self
+                .layout
+                .cell_at(self.pointer.0, self.pointer.1, &self.metrics);
             for _ in 0..lines.min(10) {
                 if let Some(bytes) =
                     mouse::report(protocol, button, Kind::Press, mods, (at.1, at.0))

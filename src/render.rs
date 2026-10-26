@@ -103,6 +103,15 @@ impl Layout {
         self.y + row as f32 * metrics.height
     }
 
+    /// whether a window point is on the cells, not in the margin.
+    pub fn contains(&self, x: f64, y: f64, metrics: &CellMetrics) -> bool {
+        let (x, y) = (x as f32, y as f32);
+        x >= self.x
+            && y >= self.y
+            && x < self.cell_x(self.cols, metrics)
+            && y < self.row_y(self.rows, metrics)
+    }
+
     /// the `(row, col)` under a window point, held inside the grid.
     pub fn cell_at(&self, x: f64, y: f64, metrics: &CellMetrics) -> (usize, usize) {
         let col = ((x as f32 - self.x) / metrics.width).max(0.0) as usize;
