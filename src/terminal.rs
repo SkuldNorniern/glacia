@@ -239,6 +239,11 @@ impl TerminalSession {
         self.term.is_running()
     }
 
+    /// The shell's directory, when it reports it (osc 7).
+    pub fn cwd(&self) -> Option<String> {
+        self.term.cwd()
+    }
+
     /// The shell/app's OSC 0/2 title, if it has set one.
     pub fn title(&self) -> Option<String> {
         self.term.title()

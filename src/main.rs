@@ -12,6 +12,7 @@ mod plugin;
 mod render;
 mod search;
 mod selection;
+mod tabs;
 mod terminal;
 mod theme;
 mod unicode;
@@ -161,25 +162,31 @@ fn main() -> AureaResult<()> {
     // The window doesn't exist yet when the shell starts; its proxy lands
     // here once it does, and output wakes the event loop through it.
     let proxy: Arc<OnceLock<WindowProxy>> = Arc::default();
-    let wake = {
+    // every tab's shell starts here: the first now, more from the app
+    let spawn: tabs::Spawner = {
         let proxy = Arc::clone(&proxy);
-        move || {
-            if let Some(proxy) = proxy.get() {
-                proxy.wake();
-            }
-        }
+        let start_dir = config.terminal.working_directory.clone();
+        Box::new(move |cols, rows, dir: Option<&str>| {
+            let proxy = Arc::clone(&proxy);
+            let wake = move || {
+                if let Some(proxy) = proxy.get() {
+                    proxy.wake();
+                }
+            };
+            TerminalSession::spawn(
+                SpawnOverrides {
+                    cols,
+                    rows,
+                    shell: &shell,
+                    args: platform::shell_args(&shell),
+                    env: platform::terminal_env(),
+                    working_directory: dir.unwrap_or(&start_dir),
+                },
+                wake,
+            )
+        })
     };
-    let term = TerminalSession::spawn(
-        SpawnOverrides {
-            cols,
-            rows,
-            shell: &shell,
-            args: platform::shell_args(&shell),
-            env: platform::terminal_env(),
-            working_directory: &config.terminal.working_directory,
-        },
-        wake,
-    );
+    let term = spawn(cols, rows, None);
 
     let mut window = Window::new(
         DEFAULT_TITLE,
@@ -202,5 +209,5 @@ fn main() -> AureaResult<()> {
     let _ = term.resize(cols, rows);
     term.set_palette(theme::Colors::theme().palette());
 
-    App::new(config, term, metrics, fonts, diagnostics).run(&window, &mut canvas)
+    App::new(config, term, spawn, metrics, fonts, diagnostics).run(&window, &mut canvas)
 }

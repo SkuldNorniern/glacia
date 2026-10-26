@@ -12,9 +12,10 @@ use vanta::{Cell, CursorStyle, Event, MouseTracking};
 use crate::config::{Config, CursorShape, MAX_FONT_SIZE, MIN_FONT_SIZE};
 use crate::input::{self, TextInputNormalizer};
 use crate::mouse::{self, Kind};
-use crate::render::{self, CellMetrics, Layout, RowFonts, SelectionRange};
+use crate::render::{self, CellMetrics, Layout, RowFonts, SelectionRange, TabLabel};
 use crate::search::Search;
 use crate::selection::{Selection, Spot, Unit};
+use crate::tabs::{self, Parked, Spawner};
 use crate::terminal::TerminalSession;
 use crate::theme::Colors;
 use crate::{cell_metrics, row_fonts};
@@ -37,6 +38,22 @@ fn paste_text(text: &str) -> String {
         .collect::<String>()
         .replace("\r\n", "\r")
         .replace('\n', "\r")
+}
+
+/// Ctrl+Alt+1..9 picks a tab: the digit's index.
+fn tab_digit(key: KeyCode) -> Option<usize> {
+    let keys = [
+        KeyCode::Key1,
+        KeyCode::Key2,
+        KeyCode::Key3,
+        KeyCode::Key4,
+        KeyCode::Key5,
+        KeyCode::Key6,
+        KeyCode::Key7,
+        KeyCode::Key8,
+        KeyCode::Key9,
+    ];
+    keys.iter().position(|k| *k == key)
 }
 
 /// `cmd.exe`'s default, un-customized console title is its own full exe
@@ -64,9 +81,17 @@ fn wheel_scrolls_up(delta_y: f64) -> bool {
     }
 }
 
+/// Widest a tab is drawn.
+const TAB_MAX: f32 = 220.0;
+
 pub struct App {
     config: Config,
     term: TerminalSession,
+    /// The tabs in order; the slot of the one on show is empty, its state
+    /// is in this struct's own fields.
+    parked: Vec<Option<Parked>>,
+    active: usize,
+    spawn: Spawner,
     metrics: CellMetrics,
     fonts: RowFonts,
     diagnostics: Vec<String>,
@@ -111,6 +136,7 @@ impl App {
     pub fn new(
         config: Config,
         term: TerminalSession,
+        spawn: Spawner,
         metrics: CellMetrics,
         fonts: RowFonts,
         diagnostics: Vec<String>,
@@ -127,6 +153,9 @@ impl App {
             ),
             config,
             term,
+            parked: vec![None],
+            active: 0,
+            spawn,
             metrics,
             fonts,
             diagnostics,
@@ -183,10 +212,13 @@ impl App {
                 self.set_font_size(size, canvas);
             }
             self.follow_canvas_size(canvas);
-            self.pump_shell(window);
-            if !self.term.is_running() {
+            self.pump_shell();
+            self.pump_parked();
+            // a shell that exited takes its tab with it; the last one, the window
+            if !self.term.is_running() && !self.close_tab(self.active) {
                 return Ok(());
             }
+            self.update_title(window);
             if self.needs_redraw && self.last_render.elapsed() >= FRAME_INTERVAL {
                 self.draw(canvas)?;
                 if let Some(caret) = self.caret {
@@ -213,13 +245,157 @@ impl App {
 
     fn resize_grid(&mut self, width: u32, height: u32) {
         self.window_size = (width, height);
-        self.layout = Layout::new(width, height, &self.metrics, self.padding());
-        let _ = self
-            .term
-            .resize(self.layout.cols as u16, self.layout.rows as u16);
+        let bar = self.bar_height();
+        self.layout = Layout::new(
+            width,
+            height.saturating_sub(bar),
+            &self.metrics,
+            self.padding(),
+        );
+        self.layout.y += bar as f32;
+        let (cols, rows) = (self.layout.cols as u16, self.layout.rows as u16);
+        let _ = self.term.resize(cols, rows);
         // rewrapping can shrink scrollback under the view
         self.scroll_offset = self.scroll_offset.min(self.term.scrollback_len());
+        for tab in self.parked.iter_mut().flatten() {
+            let _ = tab.term.resize(cols, rows);
+            tab.scroll_offset = tab.scroll_offset.min(tab.term.scrollback_len());
+        }
         self.needs_redraw = true;
+    }
+
+    /// The tab bar's height: none for a single tab.
+    fn bar_height(&self) -> u32 {
+        if self.parked.len() > 1 {
+            (self.metrics.height + 12.0).round() as u32
+        } else {
+            0
+        }
+    }
+
+    /// Swaps the tab on show with a parked one.
+    fn swap_tab(&mut self, tab: &mut Parked) {
+        use std::mem::swap;
+        swap(&mut self.term, &mut tab.term);
+        swap(&mut self.scroll_offset, &mut tab.scroll_offset);
+        swap(&mut self.selection, &mut tab.selection);
+        swap(&mut self.search, &mut tab.search);
+        swap(&mut self.colors, &mut tab.colors);
+        swap(&mut self.palette_version, &mut tab.palette_version);
+    }
+
+    /// Shows tab `index`.
+    fn switch_tab(&mut self, index: usize) {
+        if index == self.active {
+            return;
+        }
+        let Some(mut tab) = self.parked.get_mut(index).and_then(Option::take) else {
+            return;
+        };
+        self.swap_tab(&mut tab);
+        tab.bell = false;
+        self.parked[self.active] = Some(tab);
+        self.active = index;
+        self.reported = 0;
+        self.reported_cell = None;
+        self.mouse_dragging = false;
+        self.preedit.clear();
+        self.term.sync(self.scroll_offset);
+        self.wake_cursor();
+    }
+
+    /// A new tab next to this one, in this tab's directory when its shell
+    /// told it (osc 7).
+    fn new_tab(&mut self) {
+        let dir = self.term.cwd();
+        let (cols, rows) = (self.layout.cols as u16, self.layout.rows as u16);
+        let Ok(term) = (self.spawn)(cols, rows, dir.as_deref()) else {
+            return;
+        };
+        term.set_palette(Colors::theme().palette());
+        let index = self.active + 1;
+        self.parked.insert(index, Some(Parked::new(term)));
+        // the bar may have just shown up
+        let (w, h) = self.window_size;
+        self.resize_grid(w, h);
+        self.switch_tab(index);
+    }
+
+    /// Closes tab `index`, its shell with it. False when it was the last.
+    fn close_tab(&mut self, index: usize) -> bool {
+        if self.parked.len() <= 1 || index >= self.parked.len() {
+            return false;
+        }
+        if index == self.active {
+            let next = if index + 1 < self.parked.len() {
+                index + 1
+            } else {
+                index - 1
+            };
+            self.switch_tab(next);
+        }
+        // dropping the tab kills its shell
+        self.parked.remove(index);
+        if index < self.active {
+            self.active -= 1;
+        }
+        let (w, h) = self.window_size;
+        self.resize_grid(w, h);
+        true
+    }
+
+    /// Hidden tabs: ones whose shell exited close; clipboard writes still
+    /// land, and a bell marks the tab.
+    fn pump_parked(&mut self) {
+        let mut gone = Vec::new();
+        for (i, slot) in self.parked.iter_mut().enumerate() {
+            let Some(tab) = slot else { continue };
+            if !tab.term.is_running() {
+                gone.push(i);
+                continue;
+            }
+            for event in tab.term.take_events() {
+                match event {
+                    Event::Bell => {
+                        if !tab.bell {
+                            tab.bell = true;
+                            self.needs_redraw = true;
+                        }
+                    }
+                    Event::Clipboard(text) if self.config.terminal.clipboard_write => {
+                        let _ = set_clipboard_text(&text);
+                    }
+                    Event::Clipboard(_) => {}
+                }
+            }
+        }
+        for i in gone.into_iter().rev() {
+            self.close_tab(i);
+        }
+    }
+
+    /// What the tab bar shows.
+    fn tab_labels(&self) -> Vec<TabLabel> {
+        let label = |term: &TerminalSession| {
+            term.title()
+                .map_or_else(|| "shell".to_owned(), |t| display_shell_name(&t).to_owned())
+        };
+        self.parked
+            .iter()
+            .enumerate()
+            .map(|(i, slot)| match slot {
+                Some(tab) => TabLabel {
+                    text: label(&tab.term),
+                    active: false,
+                    bell: tab.bell,
+                },
+                None => TabLabel {
+                    text: label(&self.term),
+                    active: i == self.active,
+                    bell: false,
+                },
+            })
+            .collect()
     }
 
     fn clear_selection(&mut self) {
@@ -301,6 +477,24 @@ impl App {
                         .write_str(if self.focused { "\x1b[I" } else { "\x1b[O" });
                 }
                 self.wake_cursor();
+            }
+            WindowEvent::MouseButton {
+                button,
+                pressed: true,
+                x,
+                y,
+                ..
+            } if (*y as f32) < self.bar_height() as f32 => {
+                let width = self.window_size.0 as f32;
+                if let Some(i) = tabs::tab_at(*x, width, self.parked.len(), TAB_MAX) {
+                    match button {
+                        MouseButton::Left => self.switch_tab(i),
+                        MouseButton::Middle => {
+                            self.close_tab(i);
+                        }
+                        _ => {}
+                    }
+                }
             }
             WindowEvent::MouseButton {
                 button,
@@ -453,6 +647,23 @@ impl App {
                 _ => self.base_font_size,
             };
             self.zoom_to = Some(next.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE));
+        } else if copy_paste && key == KeyCode::T {
+            self.new_tab();
+        } else if copy_paste && key == KeyCode::W {
+            // the last tab stays: closing the window is the close button's job
+            self.close_tab(self.active);
+        } else if modifiers.ctrl && key == KeyCode::Tab && self.parked.len() > 1 {
+            let n = self.parked.len();
+            let next = if modifiers.shift {
+                (self.active + n - 1) % n
+            } else {
+                (self.active + 1) % n
+            };
+            self.switch_tab(next);
+        } else if let Some(i) = tab_digit(key).filter(|_| modifiers.ctrl && modifiers.alt) {
+            // ctrl+alt+9 is the last tab, like a browser
+            let i = if i == 8 { self.parked.len() - 1 } else { i };
+            self.switch_tab(i);
         } else if copy_paste && key == KeyCode::F {
             if self.search.take().is_none() {
                 self.search = Some(Search::default());
@@ -679,7 +890,7 @@ impl App {
 
     /// Takes new shell output, the title with it, and blinks the cursor
     /// while the shell is quiet.
-    fn pump_shell(&mut self, window: &Window) {
+    fn pump_shell(&mut self) {
         let blink = Duration::from_millis(self.config.cursor.blink_interval_ms);
         let history = self.term.scrollback_len();
         let dropped = self.term.dropped();
@@ -704,7 +915,6 @@ impl App {
                 self.scroll_offset = 0;
                 self.term.sync(0);
             }
-            self.update_title(window);
         } else if self.blinks()
             && self.last_output.elapsed() >= blink
             && self.last_blink.elapsed() >= blink
@@ -773,6 +983,7 @@ impl App {
         wanted && self.focused && self.term.app_cursor_visible()
     }
 
+    /// The window title: the tab on show's.
     fn update_title(&mut self, window: &Window) {
         let title = self.term.title();
         if title == self.last_title {
@@ -824,12 +1035,24 @@ impl App {
                 &found,
                 &self.colors,
             )?;
+            let bar = self.bar_height() as f32;
+            if bar > 0.0 {
+                render::draw_tab_bar(
+                    ctx,
+                    &self.tab_labels(),
+                    (self.window_size.0 as f32, bar),
+                    TAB_MAX,
+                    &self.metrics,
+                    &self.fonts,
+                    &self.colors,
+                )?;
+            }
             if let Some(search) = &self.search {
                 render::draw_find_bar(
                     ctx,
                     &search.query,
                     search.count(),
-                    self.window_size.0 as f32,
+                    (self.window_size.0 as f32, bar),
                     &self.metrics,
                     &self.fonts,
                     &self.colors,

@@ -14,6 +14,7 @@ use vanta::{Cell, CellKind};
 
 use crate::config::CursorShape;
 use crate::search::Piece;
+use crate::tabs::tab_width;
 use crate::theme::{self, Colors};
 use crate::unicode::{compose_hangul_jamo, is_hangul_jamo};
 
@@ -820,13 +821,74 @@ pub fn draw_grid(
     Ok(())
 }
 
+/// One tab in the bar: its label, whether it is on show, and whether it
+/// rang while hidden.
+pub struct TabLabel {
+    pub text: String,
+    pub active: bool,
+    pub bell: bool,
+}
+
+/// The tab bar across the top, `height` tall; tabs share the width.
+pub fn draw_tab_bar(
+    ctx: &mut dyn DrawingContext,
+    tabs: &[TabLabel],
+    (width, height): (f32, f32),
+    tab_max: f32,
+    metrics: &CellMetrics,
+    fonts: &RowFonts,
+    colors: &Colors,
+) -> AureaResult<()> {
+    ctx.draw_rect(Rect::new(0.0, 0.0, width, height), &solid(theme::BAR))?;
+    let w = tab_width(width, tabs.len(), tab_max);
+    let pad = 10.0;
+    let baseline = ((height - metrics.height) / 2.0 + metrics.baseline_offset).round();
+    for (i, tab) in tabs.iter().enumerate() {
+        let x = i as f32 * w;
+        if tab.active {
+            ctx.draw_rect(Rect::new(x, 0.0, w, height), &solid(colors.background))?;
+            ctx.draw_rect(Rect::new(x, 0.0, w, 2.0), &solid(theme::FOUND_CURRENT))?;
+        } else if i > 0 && !tabs[i - 1].active {
+            ctx.draw_rect(
+                Rect::new(x, height * 0.25, 1.0, height * 0.5),
+                &solid(theme::BAR_TEXT_DIM),
+            )?;
+        }
+        let mut text = if tab.bell {
+            format!("• {}", tab.text)
+        } else {
+            tab.text.clone()
+        };
+        let slot = fonts.font_slot_for_chars(ctx, text.chars());
+        let font = fonts.pick(false, false, slot);
+        // cut long titles to the tab, with an ellipsis
+        let room = w - 2.0 * pad;
+        while text.chars().count() > 1
+            && ctx
+                .measure_text(&text, font)
+                .is_ok_and(|m| m.advance > room)
+        {
+            text.pop();
+            text.pop();
+            text.push('…');
+        }
+        let fg = if tab.active {
+            colors.foreground
+        } else {
+            theme::BAR_TEXT_DIM
+        };
+        ctx.draw_text_with_font(&text, Point::new(x + pad, baseline), font, &solid(fg))?;
+    }
+    Ok(())
+}
+
 /// The find bar in the top right corner: the query with a caret, and
 /// where the current match is among all of them.
 pub fn draw_find_bar(
     ctx: &mut dyn DrawingContext,
     query: &str,
     (current, total): (usize, usize),
-    window_width: f32,
+    (window_width, top): (f32, f32),
     metrics: &CellMetrics,
     fonts: &RowFonts,
     colors: &Colors,
@@ -835,7 +897,7 @@ pub fn draw_find_bar(
     let h = metrics.height + 2.0 * pad;
     let w = (metrics.width * 36.0).min(window_width - 16.0).max(120.0);
     let x = (window_width - w - 8.0).round();
-    let y = 8.0;
+    let y = top + 8.0;
     ctx.draw_shadow(Rect::new(x, y, w, h), 6.0, 10.0, Color::rgba(0, 0, 0, 90))?;
     ctx.draw_round_rect(Rect::new(x, y, w, h), 6.0, &solid(theme::BAR))?;
     let baseline = (y + pad + metrics.baseline_offset).round();
