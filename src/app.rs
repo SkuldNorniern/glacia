@@ -3,7 +3,7 @@
 
 use std::time::{Duration, Instant};
 
-use aurea::render::{Canvas, Point, Rect};
+use aurea::render::{Canvas, Color, DrawingContext, Paint, PaintStyle, Point, Rect};
 use aurea::{AureaResult, KeyCode, Modifiers, MouseButton, Window, WindowEvent};
 use aurea::{clipboard_text, set_clipboard_text};
 
@@ -15,9 +15,9 @@ use crate::mouse::{self, Kind};
 use crate::render::{self, CellMetrics, Layout, RowFonts, SelectionRange, TabLabel};
 use crate::search::Search;
 use crate::selection::{Selection, Spot, Unit};
-use crate::tabs::{self, Parked, Spawner};
+use crate::tabs::{self, Area, Dir, Node, Pane, Spawner};
 use crate::terminal::TerminalSession;
-use crate::theme::Colors;
+use crate::theme::{self, Colors};
 use crate::{cell_metrics, row_fonts};
 
 const FRAME_INTERVAL: Duration = Duration::from_micros(16_667); // 60 FPS render cap
@@ -38,6 +38,25 @@ fn paste_text(text: &str) -> String {
         .collect::<String>()
         .replace("\r\n", "\r")
         .replace('\n', "\r")
+}
+
+fn solid(color: Color) -> Paint {
+    Paint {
+        color,
+        style: PaintStyle::Fill,
+        ..Default::default()
+    }
+}
+
+/// An arrow key as a step: `(dx, dy)`.
+fn arrow(key: KeyCode) -> Option<(i8, i8)> {
+    Some(match key {
+        KeyCode::Left => (-1, 0),
+        KeyCode::Right => (1, 0),
+        KeyCode::Up => (0, -1),
+        KeyCode::Down => (0, 1),
+        _ => return None,
+    })
 }
 
 /// Ctrl+Alt+1..9 picks a tab: the digit's index.
@@ -83,14 +102,21 @@ fn wheel_scrolls_up(delta_y: f64) -> bool {
 
 /// Widest a tab is drawn.
 const TAB_MAX: f32 = 220.0;
+/// The line between split panes.
+const PANE_GAP: f32 = 1.0;
 
 pub struct App {
     config: Config,
     term: TerminalSession,
-    /// The tabs in order; the slot of the one on show is empty, its state
-    /// is in this struct's own fields.
-    parked: Vec<Option<Parked>>,
+    /// Every pane by id. The one with the keyboard has an empty slot; its
+    /// state is in this struct's own fields.
+    panes: Vec<Option<Pane>>,
+    focused: usize,
+    /// Each tab's panes, and which last had the keyboard there.
+    tabs: Vec<(Node, usize)>,
     active: usize,
+    /// The panes on show: id, area, and cell layout.
+    areas: Vec<(usize, Area, Layout)>,
     spawn: Spawner,
     metrics: CellMetrics,
     fonts: RowFonts,
@@ -110,7 +136,7 @@ pub struct App {
     reported_cell: Option<(usize, usize)>,
     /// Where the pointer is, in window pixels, for wheel reports.
     pointer: (f64, f64),
-    focused: bool,
+    window_focused: bool,
     /// What the frame draws with, and the vanta palette version it is from.
     colors: Colors,
     palette_version: u64,
@@ -142,7 +168,7 @@ impl App {
         diagnostics: Vec<String>,
     ) -> Self {
         let now = Instant::now();
-        Self {
+        let mut app = Self {
             window_size: (config.window.width, config.window.height),
             base_font_size: config.font.size,
             layout: Layout::new(
@@ -153,8 +179,11 @@ impl App {
             ),
             config,
             term,
-            parked: vec![None],
+            panes: vec![None],
+            focused: 0,
+            tabs: vec![(Node::Leaf(0), 0)],
             active: 0,
+            areas: Vec::new(),
             spawn,
             metrics,
             fonts,
@@ -167,7 +196,7 @@ impl App {
             reported: 0,
             reported_cell: None,
             pointer: (0.0, 0.0),
-            focused: true,
+            window_focused: true,
             colors: Colors::theme(),
             palette_version: 0,
             zoom_to: None,
@@ -179,7 +208,10 @@ impl App {
             last_render: now,
             last_title: None,
             needs_redraw: true,
-        }
+        };
+        // the first pane's place in the window
+        app.refit();
+        app
     }
 
     /// Runs until the window closes or the shell exits.
@@ -213,9 +245,9 @@ impl App {
             }
             self.follow_canvas_size(canvas);
             self.pump_shell();
-            self.pump_parked();
-            // a shell that exited takes its tab with it; the last one, the window
-            if !self.term.is_running() && !self.close_tab(self.active) {
+            self.pump_panes();
+            // a shell that exited takes its pane with it; the last one, the window
+            if !self.term.is_running() && !self.close_pane(self.focused) {
                 return Ok(());
             }
             self.update_title(window);
@@ -246,56 +278,76 @@ impl App {
     fn resize_grid(&mut self, width: u32, height: u32) {
         self.window_size = (width, height);
         let bar = self.bar_height();
-        self.layout = Layout::new(
-            width,
-            height.saturating_sub(bar),
-            &self.metrics,
-            self.padding(),
+        let area = (
+            0.0,
+            bar as f32,
+            width as f32,
+            height.saturating_sub(bar) as f32,
         );
-        self.layout.y += bar as f32;
-        let (cols, rows) = (self.layout.cols as u16, self.layout.rows as u16);
-        let _ = self.term.resize(cols, rows);
-        // rewrapping can shrink scrollback under the view
-        self.scroll_offset = self.scroll_offset.min(self.term.scrollback_len());
-        for tab in self.parked.iter_mut().flatten() {
-            let _ = tab.term.resize(cols, rows);
-            tab.scroll_offset = tab.scroll_offset.min(tab.term.scrollback_len());
+        let tree = &self.tabs[self.active].0;
+        let padding = self.padding();
+        self.areas = tree
+            .areas(area, PANE_GAP)
+            .into_iter()
+            .map(|(id, (x, y, w, h))| {
+                let mut layout = Layout::new(w as u32, h as u32, &self.metrics, padding);
+                layout.x += x;
+                layout.y += y;
+                (id, (x, y, w, h), layout)
+            })
+            .collect();
+        for &(id, _, layout) in &self.areas {
+            let (cols, rows) = (layout.cols as u16, layout.rows as u16);
+            if id == self.focused {
+                self.layout = layout;
+                let _ = self.term.resize(cols, rows);
+                // rewrapping can shrink scrollback under the view
+                self.scroll_offset = self.scroll_offset.min(self.term.scrollback_len());
+            } else if let Some(Some(pane)) = self.panes.get_mut(id) {
+                let _ = pane.term.resize(cols, rows);
+                pane.scroll_offset = pane.scroll_offset.min(pane.term.scrollback_len());
+            }
         }
         self.needs_redraw = true;
     }
 
+    fn refit(&mut self) {
+        let (w, h) = self.window_size;
+        self.resize_grid(w, h);
+    }
+
     /// The tab bar's height: none for a single tab.
     fn bar_height(&self) -> u32 {
-        if self.parked.len() > 1 {
+        if self.tabs.len() > 1 {
             (self.metrics.height + 12.0).round() as u32
         } else {
             0
         }
     }
 
-    /// Swaps the tab on show with a parked one.
-    fn swap_tab(&mut self, tab: &mut Parked) {
-        use std::mem::swap;
-        swap(&mut self.term, &mut tab.term);
-        swap(&mut self.scroll_offset, &mut tab.scroll_offset);
-        swap(&mut self.selection, &mut tab.selection);
-        swap(&mut self.search, &mut tab.search);
-        swap(&mut self.colors, &mut tab.colors);
-        swap(&mut self.palette_version, &mut tab.palette_version);
-    }
-
-    /// Shows tab `index`.
-    fn switch_tab(&mut self, index: usize) {
-        if index == self.active {
+    /// Gives pane `id` the keyboard: its state swaps into this struct.
+    fn focus(&mut self, id: usize) {
+        if id == self.focused {
             return;
         }
-        let Some(mut tab) = self.parked.get_mut(index).and_then(Option::take) else {
+        let Some(mut pane) = self.panes.get_mut(id).and_then(Option::take) else {
             return;
         };
-        self.swap_tab(&mut tab);
-        tab.bell = false;
-        self.parked[self.active] = Some(tab);
-        self.active = index;
+        {
+            use std::mem::swap;
+            swap(&mut self.term, &mut pane.term);
+            swap(&mut self.scroll_offset, &mut pane.scroll_offset);
+            swap(&mut self.selection, &mut pane.selection);
+            swap(&mut self.search, &mut pane.search);
+            swap(&mut self.colors, &mut pane.colors);
+            swap(&mut self.palette_version, &mut pane.palette_version);
+        }
+        pane.bell = false;
+        self.panes[self.focused] = Some(pane);
+        self.focused = id;
+        if let Some(&(_, _, layout)) = self.areas.iter().find(|a| a.0 == id) {
+            self.layout = layout;
+        }
         self.reported = 0;
         self.reported_cell = None;
         self.mouse_dragging = false;
@@ -304,61 +356,117 @@ impl App {
         self.wake_cursor();
     }
 
-    /// A new tab next to this one, in this tab's directory when its shell
-    /// told it (osc 7).
-    fn new_tab(&mut self) {
-        let dir = self.term.cwd();
-        let (cols, rows) = (self.layout.cols as u16, self.layout.rows as u16);
-        let Ok(term) = (self.spawn)(cols, rows, dir.as_deref()) else {
+    /// Shows tab `index`, with the pane that last had the keyboard there.
+    fn switch_tab(&mut self, index: usize) {
+        if index == self.active || index >= self.tabs.len() {
             return;
-        };
-        term.set_palette(Colors::theme().palette());
-        let index = self.active + 1;
-        self.parked.insert(index, Some(Parked::new(term)));
-        // the bar may have just shown up
-        let (w, h) = self.window_size;
-        self.resize_grid(w, h);
-        self.switch_tab(index);
+        }
+        self.tabs[self.active].1 = self.focused;
+        self.active = index;
+        self.focus(self.tabs[index].1);
+        self.refit();
     }
 
-    /// Closes tab `index`, its shell with it. False when it was the last.
-    fn close_tab(&mut self, index: usize) -> bool {
-        if self.parked.len() <= 1 || index >= self.parked.len() {
+    /// Starts a shell in this pane's directory, when its shell told it
+    /// (osc 7). The new pane's id.
+    fn spawn_pane(&mut self) -> Option<usize> {
+        let dir = self.term.cwd();
+        let (cols, rows) = (self.layout.cols as u16, self.layout.rows as u16);
+        let term = (self.spawn)(cols, rows, dir.as_deref()).ok()?;
+        term.set_palette(Colors::theme().palette());
+        self.panes.push(Some(Pane::new(term)));
+        Some(self.panes.len() - 1)
+    }
+
+    /// A new tab right of this one.
+    fn new_tab(&mut self) {
+        let Some(id) = self.spawn_pane() else {
+            return;
+        };
+        self.tabs.insert(self.active + 1, (Node::Leaf(id), id));
+        self.switch_tab(self.active + 1);
+        // the bar may have just shown up
+        self.refit();
+    }
+
+    /// Splits the pane with the keyboard; the new one gets it.
+    fn split(&mut self, dir: Dir) {
+        let Some(id) = self.spawn_pane() else {
+            return;
+        };
+        self.tabs[self.active].0.split(self.focused, id, dir);
+        self.refit();
+        self.focus(id);
+    }
+
+    /// Closes pane `id` and its shell; a tab with no panes left closes
+    /// too. False when it was the very last pane.
+    fn close_pane(&mut self, id: usize) -> bool {
+        let Some(t) = self.tabs.iter().position(|(tree, _)| tree.contains(id)) else {
+            return true;
+        };
+        let rest = self.tabs[t].0.clone().remove(id);
+        if rest.is_none() && self.tabs.len() == 1 {
             return false;
         }
-        if index == self.active {
-            let next = if index + 1 < self.parked.len() {
-                index + 1
-            } else {
-                index - 1
-            };
-            self.switch_tab(next);
+        match rest {
+            Some(tree) => {
+                let next = tree.panes()[0];
+                if self.tabs[t].1 == id {
+                    self.tabs[t].1 = next;
+                }
+                self.tabs[t].0 = tree;
+                if id == self.focused {
+                    self.focus(next);
+                }
+            }
+            None => {
+                if t == self.active {
+                    let next = if t + 1 < self.tabs.len() {
+                        t + 1
+                    } else {
+                        t - 1
+                    };
+                    self.switch_tab(next);
+                }
+                self.tabs.remove(t);
+                if t < self.active {
+                    self.active -= 1;
+                }
+            }
         }
-        // dropping the tab kills its shell
-        self.parked.remove(index);
-        if index < self.active {
-            self.active -= 1;
+        // dropping the pane kills its shell
+        if let Some(slot) = self.panes.get_mut(id) {
+            *slot = None;
         }
-        let (w, h) = self.window_size;
-        self.resize_grid(w, h);
+        self.refit();
         true
     }
 
-    /// Hidden tabs: ones whose shell exited close; clipboard writes still
-    /// land, and a bell marks the tab.
-    fn pump_parked(&mut self) {
+    /// Panes without the keyboard: ones whose shell exited close, the ones
+    /// on show follow their output, clipboard writes land and a bell marks
+    /// the tab.
+    fn pump_panes(&mut self) {
         let mut gone = Vec::new();
-        for (i, slot) in self.parked.iter_mut().enumerate() {
-            let Some(tab) = slot else { continue };
-            if !tab.term.is_running() {
-                gone.push(i);
+        let shown: Vec<usize> = self.areas.iter().map(|a| a.0).collect();
+        for (id, slot) in self.panes.iter_mut().enumerate() {
+            let Some(pane) = slot else { continue };
+            if !pane.term.is_running() {
+                gone.push(id);
                 continue;
             }
-            for event in tab.term.take_events() {
+            if shown.contains(&id) && pane.term.sync(pane.scroll_offset) {
+                if pane.term.palette_version() != pane.palette_version {
+                    pane.palette_version = pane.term.palette_version();
+                    pane.colors = Colors::from_palette(&pane.term.palette());
+                }
+                self.needs_redraw = true;
+            }
+            for event in pane.term.take_events() {
                 match event {
                     Event::Bell => {
-                        if !tab.bell {
-                            tab.bell = true;
+                        if !pane.bell {
+                            pane.bell = true;
                             self.needs_redraw = true;
                         }
                     }
@@ -369,33 +477,49 @@ impl App {
                 }
             }
         }
-        for i in gone.into_iter().rev() {
-            self.close_tab(i);
+        for id in gone {
+            self.close_pane(id);
         }
     }
 
-    /// What the tab bar shows.
+    /// What the tab bar shows: each tab's title is its keyboard pane's.
     fn tab_labels(&self) -> Vec<TabLabel> {
         let label = |term: &TerminalSession| {
             term.title()
                 .map_or_else(|| "shell".to_owned(), |t| display_shell_name(&t).to_owned())
         };
-        self.parked
+        self.tabs
             .iter()
             .enumerate()
-            .map(|(i, slot)| match slot {
-                Some(tab) => TabLabel {
-                    text: label(&tab.term),
-                    active: false,
-                    bell: tab.bell,
-                },
-                None => TabLabel {
-                    text: label(&self.term),
+            .map(|(i, (tree, last))| {
+                let bell = tree
+                    .panes()
+                    .iter()
+                    .any(|id| matches!(self.panes.get(*id), Some(Some(p)) if p.bell));
+                let text = if i == self.active {
+                    label(&self.term)
+                } else {
+                    match self.panes.get(*last) {
+                        Some(Some(pane)) => label(&pane.term),
+                        _ => "shell".to_owned(),
+                    }
+                };
+                TabLabel {
+                    text,
                     active: i == self.active,
-                    bell: false,
-                },
+                    bell,
+                }
             })
             .collect()
+    }
+
+    /// The pane under a window point, in the tab on show.
+    fn pane_at(&self, x: f64, y: f64) -> Option<usize> {
+        let (x, y) = (x as f32, y as f32);
+        self.areas
+            .iter()
+            .find(|(_, (ax, ay, w, h), _)| x >= *ax && y >= *ay && x < ax + w && y < ay + h)
+            .map(|a| a.0)
     }
 
     fn clear_selection(&mut self) {
@@ -466,15 +590,17 @@ impl App {
             }
             WindowEvent::ScaleFactorChanged { .. } => self.needs_redraw = true,
             WindowEvent::Focused | WindowEvent::Unfocused => {
-                self.focused = matches!(event, WindowEvent::Focused);
-                if !self.focused {
+                self.window_focused = matches!(event, WindowEvent::Focused);
+                if !self.window_focused {
                     // an input method may not say its composition ended
                     self.preedit.clear();
                 }
                 if self.term.focus_tracking() {
-                    let _ = self
-                        .term
-                        .write_str(if self.focused { "\x1b[I" } else { "\x1b[O" });
+                    let _ = self.term.write_str(if self.window_focused {
+                        "\x1b[I"
+                    } else {
+                        "\x1b[O"
+                    });
                 }
                 self.wake_cursor();
             }
@@ -486,14 +612,28 @@ impl App {
                 ..
             } if (*y as f32) < self.bar_height() as f32 => {
                 let width = self.window_size.0 as f32;
-                if let Some(i) = tabs::tab_at(*x, width, self.parked.len(), TAB_MAX) {
+                if let Some(i) = tabs::tab_at(*x, width, self.tabs.len(), TAB_MAX) {
                     match button {
                         MouseButton::Left => self.switch_tab(i),
                         MouseButton::Middle => {
-                            self.close_tab(i);
+                            // every pane of that tab
+                            for id in self.tabs[i].0.panes() {
+                                self.close_pane(id);
+                            }
                         }
                         _ => {}
                     }
+                }
+            }
+            WindowEvent::MouseButton {
+                pressed: true,
+                x,
+                y,
+                ..
+            } if self.pane_at(*x, *y).is_some_and(|id| id != self.focused) => {
+                // a click on another pane only gives it the keyboard
+                if let Some(id) = self.pane_at(*x, *y) {
+                    self.focus(id);
                 }
             }
             WindowEvent::MouseButton {
@@ -650,10 +790,21 @@ impl App {
         } else if copy_paste && key == KeyCode::T {
             self.new_tab();
         } else if copy_paste && key == KeyCode::W {
-            // the last tab stays: closing the window is the close button's job
-            self.close_tab(self.active);
-        } else if modifiers.ctrl && key == KeyCode::Tab && self.parked.len() > 1 {
-            let n = self.parked.len();
+            // the last pane stays: closing the window is the close button's job
+            self.close_pane(self.focused);
+        } else if modifiers.alt && modifiers.shift && key == KeyCode::Equals {
+            self.split(Dir::Right);
+        } else if modifiers.alt && modifiers.shift && key == KeyCode::Minus {
+            self.split(Dir::Down);
+        } else if let Some(arrow) = arrow(key).filter(|_| {
+            modifiers.alt && !modifiers.ctrl && !modifiers.shift && self.areas.len() > 1
+        }) {
+            let areas: Vec<(usize, Area)> = self.areas.iter().map(|a| (a.0, a.1)).collect();
+            if let Some(id) = tabs::neighbour(&areas, self.focused, arrow) {
+                self.focus(id);
+            }
+        } else if modifiers.ctrl && key == KeyCode::Tab && self.tabs.len() > 1 {
+            let n = self.tabs.len();
             let next = if modifiers.shift {
                 (self.active + n - 1) % n
             } else {
@@ -662,7 +813,7 @@ impl App {
             self.switch_tab(next);
         } else if let Some(i) = tab_digit(key).filter(|_| modifiers.ctrl && modifiers.alt) {
             // ctrl+alt+9 is the last tab, like a browser
-            let i = if i == 8 { self.parked.len() - 1 } else { i };
+            let i = if i == 8 { self.tabs.len() - 1 } else { i };
             self.switch_tab(i);
         } else if copy_paste && key == KeyCode::F {
             if self.search.take().is_none() {
@@ -959,7 +1110,7 @@ impl App {
     /// The app's DECSCUSR shape, else the configured one; an outline
     /// while another window has the keyboard.
     fn cursor_shape(&self) -> CursorShape {
-        if !self.focused {
+        if !self.window_focused {
             return CursorShape::Hollow;
         }
         match self.term.cursor_style() {
@@ -980,7 +1131,7 @@ impl App {
             | CursorStyle::BlinkingBar => true,
             _ => false,
         };
-        wanted && self.focused && self.term.app_cursor_visible()
+        wanted && self.window_focused && self.term.app_cursor_visible()
     }
 
     /// The window title: the tab on show's.
@@ -1000,6 +1151,46 @@ impl App {
     /// Rows that fit inside the padding.
     fn visible_rows(&self) -> usize {
         self.layout.rows
+    }
+
+    /// Panes on show without the keyboard, each on its own background,
+    /// with an outline cursor, and the lines between panes.
+    fn draw_other_panes(&self, ctx: &mut dyn DrawingContext) -> AureaResult<()> {
+        for &(id, (x, y, w, h), layout) in &self.areas {
+            if x > 0.0 {
+                ctx.draw_rect(
+                    Rect::new(x - PANE_GAP, y, PANE_GAP, h),
+                    &solid(theme::DIVIDER),
+                )?;
+            }
+            if y > self.bar_height() as f32 {
+                ctx.draw_rect(
+                    Rect::new(x, y - PANE_GAP, w, PANE_GAP),
+                    &solid(theme::DIVIDER),
+                )?;
+            }
+            let Some(Some(pane)) = self.panes.get(id) else {
+                continue;
+            };
+            ctx.draw_rect(Rect::new(x, y, w, h), &solid(pane.colors.background))?;
+            let cursor = pane
+                .term
+                .cursor()
+                .filter(|_| pane.term.app_cursor_visible());
+            render::draw_grid(
+                ctx,
+                pane.term.rows(),
+                cursor,
+                &self.metrics,
+                &self.fonts,
+                &CursorShape::Hollow,
+                &layout,
+                None,
+                &[],
+                &pane.colors,
+            )?;
+        }
+        Ok(())
     }
 
     fn draw(&mut self, canvas: &mut Canvas) -> AureaResult<()> {
@@ -1023,6 +1214,15 @@ impl App {
         // the margins follow an app that changed the background
         canvas.set_background_color(self.colors.background);
         canvas.draw(|ctx| {
+            if self.areas.len() > 1 {
+                self.draw_other_panes(ctx)?;
+                let (x, y, w, h) = self
+                    .areas
+                    .iter()
+                    .find(|a| a.0 == self.focused)
+                    .map_or((0.0, 0.0, 0.0, 0.0), |a| a.1);
+                ctx.draw_rect(Rect::new(x, y, w, h), &solid(self.colors.background))?;
+            }
             render::draw_grid(
                 ctx,
                 rows,
