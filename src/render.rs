@@ -548,6 +548,11 @@ fn draw_row(
         } else {
             theme::FOUND
         });
+        // a match ending on a wide glyph covers both its cells
+        let b = match row.get(b.saturating_add(1)) {
+            Some(cell) if matches!(cell.kind, CellKind::Continuation) => b + 1,
+            _ => b,
+        };
         for i in a..=b.min(row.len().saturating_sub(1)) {
             ctx.draw_rect(cell_rect(i), &paint)?;
         }
@@ -861,16 +866,26 @@ pub fn draw_tab_bar(
         };
         let slot = fonts.font_slot_for_chars(ctx, text.chars());
         let font = fonts.pick(false, false, slot);
-        // cut long titles to the tab, with an ellipsis
+        // cut long titles to the tab, with an ellipsis: grown from the
+        // start while it fits
         let room = w - 2.0 * pad;
-        while text.chars().count() > 1
-            && ctx
-                .measure_text(&text, font)
-                .is_ok_and(|m| m.advance > room)
+        if ctx
+            .measure_text(&text, font)
+            .is_ok_and(|m| m.advance > room)
         {
-            text.pop();
-            text.pop();
-            text.push('…');
+            let mut cut = String::from("…");
+            for c in text.chars() {
+                let mut next = cut.clone();
+                next.insert(next.len() - '…'.len_utf8(), c);
+                if ctx
+                    .measure_text(&next, font)
+                    .is_ok_and(|m| m.advance > room)
+                {
+                    break;
+                }
+                cut = next;
+            }
+            text = cut;
         }
         let fg = if tab.active {
             colors.foreground
@@ -923,14 +938,17 @@ pub fn draw_find_bar(
         (query, false)
     };
     // the end of a long query, where typing happens
+    // grown from the end while it fits: the cost stays with what shows
     let room = w - 3.0 * pad - count_w;
-    let mut start = 0;
-    while start < shown.len()
-        && ctx
-            .measure_text(&shown[start..], font)
+    let mut start = shown.len();
+    for (i, _) in shown.char_indices().rev() {
+        if ctx
+            .measure_text(&shown[i..], font)
             .is_ok_and(|m| m.advance > room)
-    {
-        start += shown[start..].chars().next().map_or(1, char::len_utf8);
+        {
+            break;
+        }
+        start = i;
     }
     let shown = &shown[start..];
     let text_x = (x + pad).round();

@@ -209,5 +209,10 @@ fn main() -> AureaResult<()> {
     let _ = term.resize(cols, rows);
     term.set_palette(theme::Colors::theme().palette());
 
-    App::new(config, term, spawn, metrics, fonts, diagnostics).run(&window, &mut canvas)
+    let wake: app::Wake = Arc::new(move || {
+        if let Some(proxy) = proxy.get() {
+            proxy.wake();
+        }
+    });
+    App::new(config, term, spawn, wake, metrics, fonts, diagnostics).run(&window, &mut canvas)
 }

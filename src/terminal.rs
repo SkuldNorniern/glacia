@@ -202,9 +202,14 @@ impl TerminalSession {
         self.term.set_palette(palette);
     }
 
-    /// Every match of `needle`, with the dropped count they were found at.
-    pub fn find_all(&self, needle: &str) -> (u64, Vec<Found>) {
-        self.term.find_all(needle)
+    /// Searches for `needle` on a thread; `done` gets every match and
+    /// the dropped count they were found at.
+    pub fn find_in_background(
+        &self,
+        needle: String,
+        done: impl FnOnce((u64, Vec<Found>)) + Send + 'static,
+    ) {
+        self.term.find_all_in_background(needle, done);
     }
 
     /// Bells and clipboard writes from the app.

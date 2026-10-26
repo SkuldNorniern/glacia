@@ -2,15 +2,41 @@
 //! which one is current. Lines are numbered like a selection's, with
 //! vanta's `dropped` added, so matches stay put while output arrives.
 
+use std::sync::mpsc::Receiver;
+use std::time::{Duration, Instant};
+
 use vanta::Found;
 
 use crate::selection::Spot;
 
-#[derive(Default)]
+/// Least time between searches run because output came in.
+pub const RESEARCH_EVERY: Duration = Duration::from_millis(300);
+
 pub struct Search {
     pub query: String,
     found: Vec<(Spot, Spot)>,
     current: Option<usize>,
+    /// A search running on vanta's side.
+    pub pending: Option<Receiver<(u64, Vec<Found>)>>,
+    /// The matches are behind: the query, the text or its wrapping changed.
+    pub stale: bool,
+    /// Show the current match once the results are in (the query changed).
+    pub jump: bool,
+    pub done_at: Instant,
+}
+
+impl Default for Search {
+    fn default() -> Self {
+        Self {
+            query: String::new(),
+            found: Vec::new(),
+            current: None,
+            pending: None,
+            stale: false,
+            jump: false,
+            done_at: Instant::now(),
+        }
+    }
 }
 
 /// A piece of a match on one row of the view: row, first and last column,
@@ -18,12 +44,25 @@ pub struct Search {
 pub type Piece = (usize, usize, usize, bool);
 
 impl Search {
-    /// Takes new matches from vanta (found when `dropped` lines were gone)
-    /// and makes the newest one current: the one nearest the prompt.
+    /// Takes new matches from vanta (found when `dropped` lines were gone).
+    /// The current match stays current when it is still there; else the
+    /// newest one is, the one nearest the prompt.
     pub fn set_found(&mut self, dropped: u64, found: &[Found]) {
+        let was = self.current();
         let spot = |(line, col): (usize, usize)| (dropped + line as u64, col);
         self.found = found.iter().map(|f| (spot(f.start), spot(f.end))).collect();
-        self.current = self.found.len().checked_sub(1);
+        self.current = was
+            .filter(|_| !self.jump)
+            .and_then(|was| self.found.iter().position(|m| *m == was))
+            .or_else(|| self.found.len().checked_sub(1));
+        self.done_at = Instant::now();
+    }
+
+    /// Whether a new search should start now.
+    pub fn due(&self) -> bool {
+        self.stale
+            && self.pending.is_none()
+            && (self.jump || self.done_at.elapsed() >= RESEARCH_EVERY)
     }
 
     /// Steps to the next older match, or newer; wraps round.
@@ -87,6 +126,19 @@ mod tests {
         assert_eq!(s.count(), (2, 2), "wrapped round");
         s.step(false);
         assert_eq!(s.count(), (1, 2));
+        // new results keep the current match when it is still there
+        s.set_found(
+            10,
+            &[
+                found((0, 0), (0, 2)),
+                found((5, 1), (5, 3)),
+                found((7, 0), (7, 1)),
+            ],
+        );
+        assert_eq!(s.count(), (1, 3));
+        s.jump = true;
+        s.set_found(10, &[found((0, 0), (0, 2)), found((5, 1), (5, 3))]);
+        assert_eq!(s.count(), (2, 2), "a new query starts from the newest");
         s.set_found(0, &[]);
         assert_eq!((s.current(), s.count()), (None, (0, 0)));
         s.step(true);

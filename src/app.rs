@@ -1,6 +1,9 @@
 //! One terminal window: the shell session, what the view shows, and how
 //! window events change it.
 
+use std::mem::take;
+use std::sync::Arc;
+use std::sync::mpsc::{TryRecvError, channel};
 use std::time::{Duration, Instant};
 
 use aurea::render::{Canvas, Color, DrawingContext, Paint, PaintStyle, Point, Rect};
@@ -13,7 +16,7 @@ use crate::config::{Config, CursorShape, MAX_FONT_SIZE, MIN_FONT_SIZE};
 use crate::input::{self, TextInputNormalizer};
 use crate::mouse::{self, Kind};
 use crate::render::{self, CellMetrics, Layout, RowFonts, SelectionRange, TabLabel};
-use crate::search::Search;
+use crate::search::{RESEARCH_EVERY, Search};
 use crate::selection::{Selection, Spot, Unit};
 use crate::tabs::{self, Area, Dir, Node, Pane, Spawner};
 use crate::terminal::TerminalSession;
@@ -100,6 +103,32 @@ fn wheel_scrolls_up(delta_y: f64) -> bool {
     }
 }
 
+/// Wakes the event loop from another thread.
+pub type Wake = Arc<dyn Fn() + Send + Sync>;
+
+/// Takes new output into the view. Scrolled back, the view stays on the
+/// same lines while new ones come in; at the scrollback cap they show as
+/// dropped, not as growth. A full screen app coming up shows all of it.
+/// True when output came.
+fn follow(term: &mut TerminalSession, scroll: &mut usize) -> bool {
+    let history = term.scrollback_len();
+    let dropped = term.dropped();
+    if !term.sync(*scroll) {
+        return false;
+    }
+    if *scroll > 0 && !term.is_alt_screen() {
+        let gone = usize::try_from(term.dropped() - dropped).unwrap_or(usize::MAX);
+        let grown = (term.scrollback_len() + gone).saturating_sub(history);
+        *scroll = (*scroll + grown).min(term.scrollback_len());
+        term.sync(*scroll);
+    }
+    if term.is_alt_screen() && *scroll > 0 {
+        *scroll = 0;
+        term.sync(0);
+    }
+    true
+}
+
 /// Widest a tab is drawn.
 const TAB_MAX: f32 = 220.0;
 /// The line between split panes.
@@ -118,6 +147,10 @@ pub struct App {
     /// The panes on show: id, area, and cell layout.
     areas: Vec<(usize, Area, Layout)>,
     spawn: Spawner,
+    wake: Wake,
+    /// The window title wants another look: output came, or the tab or
+    /// pane changed.
+    retitle: bool,
     metrics: CellMetrics,
     fonts: RowFonts,
     diagnostics: Vec<String>,
@@ -163,6 +196,7 @@ impl App {
         config: Config,
         term: TerminalSession,
         spawn: Spawner,
+        wake: Wake,
         metrics: CellMetrics,
         fonts: RowFonts,
         diagnostics: Vec<String>,
@@ -185,6 +219,8 @@ impl App {
             active: 0,
             areas: Vec::new(),
             spawn,
+            wake,
+            retitle: true,
             metrics,
             fonts,
             diagnostics,
@@ -225,6 +261,18 @@ impl App {
             } else {
                 self.next_blink()
             };
+            // matches behind new output are looked for again, on a timer
+            let timeout = match self
+                .search
+                .as_ref()
+                .filter(|s| s.stale && s.pending.is_none())
+            {
+                Some(search) => {
+                    let left = RESEARCH_EVERY.saturating_sub(search.done_at.elapsed());
+                    Some(timeout.map_or(left, |t| t.min(left)))
+                }
+                None => timeout,
+            };
             // a synchronized update that never ends still shows, on time
             let timeout = match (timeout, self.term.sync_deadline()) {
                 (t, Some(end)) => {
@@ -250,7 +298,10 @@ impl App {
             if !self.term.is_running() && !self.close_pane(self.focused) {
                 return Ok(());
             }
-            self.update_title(window);
+            self.poll_search();
+            if take(&mut self.retitle) {
+                self.update_title(window);
+            }
             if self.needs_redraw && self.last_render.elapsed() >= FRAME_INTERVAL {
                 self.draw(canvas)?;
                 if let Some(caret) = self.caret {
@@ -308,6 +359,10 @@ impl App {
                 pane.scroll_offset = pane.scroll_offset.min(pane.term.scrollback_len());
             }
         }
+        // rewrapping moved the text the matches point at
+        if let Some(search) = &mut self.search {
+            search.stale = true;
+        }
         self.needs_redraw = true;
     }
 
@@ -333,6 +388,11 @@ impl App {
         let Some(mut pane) = self.panes.get_mut(id).and_then(Option::take) else {
             return;
         };
+        // half typed hangul goes to the pane it was typed in
+        let pending = self.text_input.flush();
+        if !pending.is_empty() {
+            let _ = self.term.write_str(&pending);
+        }
         {
             use std::mem::swap;
             swap(&mut self.term, &mut pane.term);
@@ -353,6 +413,7 @@ impl App {
         self.mouse_dragging = false;
         self.preedit.clear();
         self.term.sync(self.scroll_offset);
+        self.retitle = true;
         self.wake_cursor();
     }
 
@@ -372,7 +433,10 @@ impl App {
     fn spawn_pane(&mut self) -> Option<usize> {
         let dir = self.term.cwd();
         let (cols, rows) = (self.layout.cols as u16, self.layout.rows as u16);
-        let term = (self.spawn)(cols, rows, dir.as_deref()).ok()?;
+        // a directory a remote shell named may not be here: start anyway
+        let term = (self.spawn)(cols, rows, dir.as_deref())
+            .or_else(|_| (self.spawn)(cols, rows, None))
+            .ok()?;
         term.set_palette(Colors::theme().palette());
         self.panes.push(Some(Pane::new(term)));
         Some(self.panes.len() - 1)
@@ -449,19 +513,23 @@ impl App {
     fn pump_panes(&mut self) {
         let mut gone = Vec::new();
         let shown: Vec<usize> = self.areas.iter().map(|a| a.0).collect();
+        let bar = self.tabs.len() > 1;
         for (id, slot) in self.panes.iter_mut().enumerate() {
             let Some(pane) = slot else { continue };
-            if !pane.term.is_running() {
-                gone.push(id);
+            // only rows on view are copied, so hidden panes follow too and
+            // a scrolled back one keeps its place
+            if !follow(&mut pane.term, &mut pane.scroll_offset) {
                 continue;
             }
-            if shown.contains(&id) && pane.term.sync(pane.scroll_offset) {
-                if pane.term.palette_version() != pane.palette_version {
-                    pane.palette_version = pane.term.palette_version();
-                    pane.colors = Colors::from_palette(&pane.term.palette());
-                }
-                self.needs_redraw = true;
+            if pane.term.palette_version() != pane.palette_version {
+                pane.palette_version = pane.term.palette_version();
+                pane.colors = Colors::from_palette(&pane.term.palette());
             }
+            if let Some(search) = &mut pane.search {
+                search.stale = true;
+            }
+            // the bar shows every tab's title
+            self.needs_redraw |= bar || shown.contains(&id);
             for event in pane.term.take_events() {
                 match event {
                     Event::Bell => {
@@ -475,6 +543,10 @@ impl App {
                     }
                     Event::Clipboard(_) => {}
                 }
+            }
+            // output ends when the shell exits: only then is it worth asking
+            if !pane.term.is_running() {
+                gone.push(id);
             }
         }
         for id in gone {
@@ -844,8 +916,13 @@ impl App {
         };
         match key {
             KeyCode::Escape => self.search = None,
-            KeyCode::Enter => {
-                search.step(!mods.shift);
+            KeyCode::Enter | KeyCode::Up | KeyCode::Down => {
+                // enter and up go to older matches, shift+enter and down to newer
+                let older = match key {
+                    KeyCode::Enter => !mods.shift,
+                    k => k == KeyCode::Up,
+                };
+                search.step(older);
                 self.show_match();
             }
             KeyCode::Backspace => {
@@ -868,14 +945,52 @@ impl App {
         true
     }
 
-    /// Searches again for the query and shows the newest match.
+    /// The query changed: search again and show the newest match.
     fn find(&mut self) {
+        if let Some(search) = &mut self.search {
+            search.stale = true;
+            search.jump = true;
+        }
+        self.poll_search();
+    }
+
+    /// Takes a finished search's matches, and starts the next one when the
+    /// matches are behind. Searches run on vanta's side, off this thread.
+    fn poll_search(&mut self) {
         let Some(search) = &mut self.search else {
             return;
         };
-        let (dropped, found) = self.term.find_all(&search.query);
-        search.set_found(dropped, &found);
-        self.show_match();
+        if let Some(rx) = &search.pending {
+            match rx.try_recv() {
+                Ok((dropped, found)) => {
+                    search.pending = None;
+                    search.set_found(dropped, &found);
+                    let jump = take(&mut search.jump);
+                    self.needs_redraw = true;
+                    if jump {
+                        self.show_match();
+                    }
+                }
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => {
+                    search.pending = None;
+                }
+            }
+        }
+        let Some(search) = &mut self.search else {
+            return;
+        };
+        if search.due() {
+            search.stale = false;
+            let (tx, rx) = channel();
+            search.pending = Some(rx);
+            let wake = Arc::clone(&self.wake);
+            self.term
+                .find_in_background(search.query.clone(), move |found| {
+                    let _ = tx.send(found);
+                    wake();
+                });
+        }
     }
 
     /// Scrolls so the current match is on view, near the middle.
@@ -1007,10 +1122,13 @@ impl App {
     }
 
     fn on_text(&mut self, text: &str) {
-        if let Some(search) = &mut self.search {
-            search
-                .query
-                .extend(text.chars().filter(|c| !c.is_control()));
+        if self.search.is_some() {
+            let text = self.text_input.normalize(text);
+            if let Some(search) = &mut self.search {
+                search
+                    .query
+                    .extend(text.chars().filter(|c| !c.is_control()));
+            }
             self.find();
             return;
         }
@@ -1043,16 +1161,10 @@ impl App {
     /// while the shell is quiet.
     fn pump_shell(&mut self) {
         let blink = Duration::from_millis(self.config.cursor.blink_interval_ms);
-        let history = self.term.scrollback_len();
-        let dropped = self.term.dropped();
-        if self.term.sync(self.scroll_offset) {
-            // scrolled back: stay on the same lines while new ones come in;
-            // at the scrollback cap they show as dropped, not as growth
-            if self.scroll_offset > 0 && !self.term.is_alt_screen() {
-                let gone = usize::try_from(self.term.dropped() - dropped).unwrap_or(usize::MAX);
-                let grown = (self.term.scrollback_len() + gone).saturating_sub(history);
-                self.scroll_offset = (self.scroll_offset + grown).min(self.term.scrollback_len());
-                self.term.sync(self.scroll_offset);
+        if follow(&mut self.term, &mut self.scroll_offset) {
+            self.retitle = true;
+            if let Some(search) = &mut self.search {
+                search.stale = true;
             }
             self.wake_cursor();
             self.last_output = Instant::now();
@@ -1060,11 +1172,6 @@ impl App {
             if self.term.palette_version() != self.palette_version {
                 self.palette_version = self.term.palette_version();
                 self.colors = Colors::from_palette(&self.term.palette());
-            }
-            // A TUI app just started: show all of its screen.
-            if self.term.is_alt_screen() && self.scroll_offset > 0 {
-                self.scroll_offset = 0;
-                self.term.sync(0);
             }
         } else if self.blinks()
             && self.last_output.elapsed() >= blink
