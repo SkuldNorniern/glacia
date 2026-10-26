@@ -7,7 +7,7 @@ use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::{Duration, Instant};
 
 use aurea::render::{Canvas, Color, DrawingContext, Paint, PaintStyle, Point, Rect};
-use aurea::{AureaResult, KeyCode, Modifiers, MouseButton, Window, WindowEvent};
+use aurea::{AureaResult, CursorIcon, KeyCode, Modifiers, MouseButton, Window, WindowEvent};
 use aurea::{clipboard_text, open_url, reduced_motion, set_clipboard_text};
 
 use vanta::{Cell, CursorStyle, Event, MouseTracking};
@@ -168,6 +168,8 @@ pub struct App {
     drop_zone: Option<(usize, Side)>,
     /// The pane with the keyboard fills its tab, the others hidden.
     zoomed: bool,
+    /// The mouse cursor the window shows now.
+    shown_cursor: CursorIcon,
     /// The line between panes under the pointer, lit up.
     divider_hover: Option<Vec<bool>>,
     /// Where each tab is drawn; tabs slide to their slot after a move.
@@ -264,6 +266,7 @@ impl App {
             drop_zone: None,
             zoomed: false,
             divider_hover: None,
+            shown_cursor: CursorIcon::Default,
             tab_x: vec![0.0],
             spawn,
             wake,
@@ -388,6 +391,10 @@ impl App {
             self.poll_search();
             if take(&mut self.retitle) {
                 self.update_title(window);
+            }
+            let cursor = self.cursor_icon();
+            if cursor != self.shown_cursor && window.set_cursor(cursor).is_ok() {
+                self.shown_cursor = cursor;
             }
             if self.needs_redraw && self.last_render.elapsed() >= FRAME_INTERVAL {
                 self.draw(canvas)?;
@@ -742,6 +749,31 @@ impl App {
         let cells = self.term.rows().get(row)?;
         let (a, b, url) = links::link_at(cells, col)?;
         Some((row, a, b, url))
+    }
+
+    /// The mouse cursor for where the pointer is: resize arrows on a line
+    /// between panes, a hand on a link ctrl would open, a text cursor over
+    /// the cells, an arrow anywhere else.
+    fn cursor_icon(&self) -> CursorIcon {
+        let (x, y) = self.pointer;
+        let line = self.dragging.clone().or_else(|| self.divider_at(x, y));
+        if let Some(line) = line {
+            return match line.dir {
+                Dir::Right => CursorIcon::ResizeHorizontal,
+                Dir::Down => CursorIcon::ResizeVertical,
+            };
+        }
+        if self.link_hover.is_some() {
+            return CursorIcon::Pointer;
+        }
+        if self.tab_drag.is_some() || (y as f32) < self.bar_height() as f32 {
+            return CursorIcon::Default;
+        }
+        if self.pane_at(x, y).is_some() {
+            CursorIcon::Text
+        } else {
+            CursorIcon::Default
+        }
     }
 
     /// The tab bar's layout now.
