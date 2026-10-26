@@ -6,11 +6,13 @@ use std::time::{Duration, Instant};
 use aurea::render::Canvas;
 use aurea::{AureaResult, KeyCode, Modifiers, MouseButton, Window, WindowEvent};
 use aurea::{clipboard_text, set_clipboard_text};
-use vanta::{Cell, CellKind};
+
+use vanta::Cell;
 
 use crate::config::Config;
 use crate::input::{self, TextInputNormalizer};
-use crate::render::{self, CellMetrics, CellRowsView, Layout, RowFonts, SelectionRange};
+use crate::render::{self, CellMetrics, Layout, RowFonts, SelectionRange};
+use crate::selection::{Selection, Spot, Unit};
 use crate::terminal::TerminalSession;
 
 const FRAME_INTERVAL: Duration = Duration::from_micros(16_667); // 60 FPS render cap
@@ -31,34 +33,6 @@ fn paste_text(text: &str) -> String {
         .collect::<String>()
         .replace("\r\n", "\r")
         .replace('\n', "\r")
-}
-
-/// Extract plain text for the cells covered by `sel` from the given rows.
-fn extract_selection_text(rows: &[Vec<Cell>], sel: SelectionRange) -> String {
-    let mut result = String::new();
-    let (r1, _) = sel.start;
-    let (r2, _) = sel.end;
-    for row_idx in r1..=r2 {
-        let Some(row) = rows.get(row_idx) else { break };
-        let Some((sc, ec)) = sel.cols_for_row(row_idx, row.len()) else {
-            continue;
-        };
-        let mut line = String::new();
-        let end = ec.min(row.len().saturating_sub(1));
-        for cell in row.iter().skip(sc).take(end.saturating_sub(sc) + 1) {
-            match &cell.kind {
-                CellKind::Char(c) => line.push(*c),
-                CellKind::Cluster(s) => line.push_str(s),
-                CellKind::Empty => line.push(' '),
-                CellKind::Continuation => {}
-            }
-        }
-        result.push_str(line.trim_end_matches(' '));
-        if row_idx < r2 {
-            result.push('\n');
-        }
-    }
-    result
 }
 
 /// `cmd.exe`'s default, un-customized console title is its own full exe
@@ -97,9 +71,7 @@ pub struct App {
     text_input: TextInputNormalizer,
     /// Rows scrolled back into history; 0 is the live screen.
     scroll_offset: usize,
-    /// Mouse selection: where the drag started and where it is now.
-    sel_anchor: Option<(usize, usize)>,
-    sel_end: Option<(usize, usize)>,
+    selection: Option<Selection>,
     mouse_dragging: bool,
     cursor_visible: bool,
     last_blink: Instant,
@@ -135,8 +107,7 @@ impl App {
             diagnostics,
             text_input: TextInputNormalizer::new(),
             scroll_offset: 0,
-            sel_anchor: None,
-            sel_end: None,
+            selection: None,
             mouse_dragging: false,
             cursor_visible: true,
             last_blink: now,
@@ -201,8 +172,39 @@ impl App {
     }
 
     fn clear_selection(&mut self) {
-        self.sel_anchor = None;
-        self.sel_end = None;
+        if self.selection.take().is_some() {
+            self.needs_redraw = true;
+        }
+    }
+
+    /// The text spot under a window point, and that line's cells.
+    fn spot_at(&self, x: f64, y: f64) -> (Spot, &[Cell]) {
+        let (row, col) = self.layout.cell_at(x, y, &self.metrics);
+        let line = self.term.dropped() + (self.term.first() + row) as u64;
+        let cells = self.term.rows().get(row).map_or(&[][..], Vec::as_slice);
+        ((line, col), cells)
+    }
+
+    /// The selection as rows of the view, cut to what is on view.
+    fn selection_on_view(&self) -> Option<SelectionRange> {
+        let sel = self.selection.filter(|s| s.shown)?;
+        let ((start, start_col), (end, end_col)) = sel.range();
+        let top = self.term.dropped() + self.term.first() as u64;
+        let bottom = top + self.term.rows().len() as u64;
+        if end < top || start >= bottom {
+            return None;
+        }
+        let from = if start < top {
+            (0, 0)
+        } else {
+            ((start - top) as usize, start_col)
+        };
+        let to = if end >= bottom {
+            (self.term.rows().len() - 1, usize::MAX)
+        } else {
+            ((end - top) as usize, end_col)
+        };
+        Some(SelectionRange::new(from, to))
     }
 
     /// Shows the cursor solid again after the user typed.
@@ -241,17 +243,10 @@ impl App {
                 pressed,
                 x,
                 y,
+                click_count,
                 ..
-            } => self.on_left_button(*pressed, *x, *y),
-            WindowEvent::MouseMove { x, y, .. } if self.mouse_dragging => {
-                let cell = self.layout.cell_at(*x, *y, &self.metrics);
-                // a selection starts once the pointer leaves the cell it
-                // was pressed in; a plain click selects nothing
-                if self.sel_end.is_some() || self.sel_anchor != Some(cell) {
-                    self.sel_end = Some(cell);
-                    self.needs_redraw = true;
-                }
-            }
+            } => self.on_left_button(*pressed, *x, *y, *click_count),
+            WindowEvent::MouseMove { x, y, .. } if self.mouse_dragging => self.on_drag(*x, *y),
             WindowEvent::KeyInput {
                 key,
                 pressed: true,
@@ -264,14 +259,43 @@ impl App {
         false
     }
 
-    fn on_left_button(&mut self, pressed: bool, x: f64, y: f64) {
+    /// A press starts a selection: by cell, by word on a double click,
+    /// by line on a triple one.
+    fn on_left_button(&mut self, pressed: bool, x: f64, y: f64, clicks: u8) {
         if pressed {
-            let cell = self.layout.cell_at(x, y, &self.metrics);
-            self.sel_anchor = Some(cell);
-            self.sel_end = None;
+            let unit = match clicks {
+                0 | 1 => Unit::Cell,
+                2 => Unit::Word,
+                _ => Unit::Line,
+            };
+            let (spot, cells) = self.spot_at(x, y);
+            self.selection = Some(Selection::start(unit, spot, cells));
         }
         self.mouse_dragging = pressed;
         self.needs_redraw = true;
+    }
+
+    fn on_drag(&mut self, x: f64, y: f64) {
+        // past the top or bottom edge the view scrolls along
+        let top = self.layout.y as f64;
+        let bottom = top + self.layout.rows as f64 * self.metrics.height as f64;
+        if !self.term.is_alt_screen() {
+            if y < top {
+                self.scroll_offset = (self.scroll_offset + 1).min(self.term.scrollback_len());
+            } else if y >= bottom {
+                self.scroll_offset = self.scroll_offset.saturating_sub(1);
+            }
+            self.term.sync(self.scroll_offset);
+        }
+        let (spot, cells) = self.spot_at(x, y);
+        let cells = cells.to_vec();
+        if let Some(sel) = &mut self.selection {
+            let before = *sel;
+            sel.extend(spot, &cells);
+            if *sel != before {
+                self.needs_redraw = true;
+            }
+        }
     }
 
     fn on_key(&mut self, key: KeyCode, modifiers: Modifiers) {
@@ -290,10 +314,21 @@ impl App {
     }
 
     fn copy_selection(&self) {
-        let Some((anchor, end)) = self.sel_anchor.zip(self.sel_end) else {
+        let Some(sel) = self.selection.filter(|s| s.shown) else {
             return;
         };
-        let text = extract_selection_text(self.term.cells(), SelectionRange::new(anchor, end));
+        let ((start, start_col), (end, end_col)) = sel.range();
+        let dropped = self.term.dropped();
+        if end < dropped {
+            // all of it fell off the top of scrollback
+            return;
+        }
+        let from = if start < dropped {
+            (0, 0)
+        } else {
+            ((start - dropped) as usize, start_col)
+        };
+        let text = self.term.text(from, ((end - dropped) as usize, end_col));
         if !text.is_empty() {
             let _ = set_clipboard_text(&text);
         }
@@ -317,7 +352,7 @@ impl App {
     /// should go to the shell instead.
     fn on_history_key(&mut self, key: KeyCode) -> bool {
         let page = (self.visible_rows() / 2).max(1);
-        let max_scroll = self.term.scrollback_rows().len();
+        let max_scroll = self.term.scrollback_len();
         self.scroll_offset = match key {
             KeyCode::PageUp => (self.scroll_offset + page).min(max_scroll),
             KeyCode::PageDown => self.scroll_offset.saturating_sub(page),
@@ -328,9 +363,6 @@ impl App {
             KeyCode::End if self.scroll_offset > 0 => 0,
             _ => return false,
         };
-        if key != KeyCode::End {
-            self.clear_selection();
-        }
         self.needs_redraw = true;
         true
     }
@@ -350,8 +382,6 @@ impl App {
     fn on_wheel(&mut self, delta_y: f64) {
         let up = wheel_scrolls_up(delta_y);
         let lines = (delta_y.abs() * 3.0).ceil() as usize;
-        // the selection is in screen cells; it would point at other text
-        self.clear_selection();
         if self.term.is_alt_screen() {
             // Wheel as arrow keys, the same sequences vim/less/htop get from
             // the keyboard.
@@ -365,7 +395,7 @@ impl App {
                 let _ = self.term.write_str(seq);
             }
         } else if up {
-            let max_scroll = self.term.scrollback_rows().len();
+            let max_scroll = self.term.scrollback_len();
             self.scroll_offset = (self.scroll_offset + lines).min(max_scroll);
         } else {
             self.scroll_offset = self.scroll_offset.saturating_sub(lines);
@@ -403,22 +433,23 @@ impl App {
     /// while the shell is quiet.
     fn pump_shell(&mut self, window: &Window) {
         let blink = Duration::from_millis(self.config.cursor.blink_interval_ms);
-        let history = self.term.scrollback_rows().len();
+        let history = self.term.scrollback_len();
         let dropped = self.term.dropped();
-        if self.term.sync() {
+        if self.term.sync(self.scroll_offset) {
             // scrolled back: stay on the same lines while new ones come in;
             // at the scrollback cap they show as dropped, not as growth
-            if self.scroll_offset > 0 {
+            if self.scroll_offset > 0 && !self.term.is_alt_screen() {
                 let gone = usize::try_from(self.term.dropped() - dropped).unwrap_or(usize::MAX);
-                let grown = (self.term.scrollback_rows().len() + gone).saturating_sub(history);
-                let max_scroll = self.term.scrollback_rows().len();
-                self.scroll_offset = (self.scroll_offset + grown).min(max_scroll);
+                let grown = (self.term.scrollback_len() + gone).saturating_sub(history);
+                self.scroll_offset = (self.scroll_offset + grown).min(self.term.scrollback_len());
+                self.term.sync(self.scroll_offset);
             }
             self.wake_cursor();
             self.last_output = Instant::now();
             // A TUI app just started: show all of its screen.
-            if self.term.is_alt_screen() {
+            if self.term.is_alt_screen() && self.scroll_offset > 0 {
                 self.scroll_offset = 0;
+                self.term.sync(0);
             }
             self.update_title(window);
         } else if self.config.cursor.blink
@@ -454,32 +485,17 @@ impl App {
     }
 
     fn draw(&mut self, canvas: &mut Canvas) -> AureaResult<()> {
-        let visible_rows = self.visible_rows();
-        let selection = self
-            .sel_anchor
-            .zip(self.sel_end)
-            .map(|(a, e)| SelectionRange::new(a, e));
-        let term = &self.term;
-        let (rows, cursor, cursor_visible, selection) = if self.scroll_offset == 0 {
-            let rows = CellRowsView::from_screen(term.cells());
-            (rows, term.cursor(), self.cursor_visible, selection)
-        } else {
-            let history = term.scrollback_rows();
-            let screen = term.cells();
-            let end = (history.len() + screen.len()).saturating_sub(self.scroll_offset);
-            let start = end.saturating_sub(visible_rows);
-            let rows = CellRowsView::from_split(history, screen, start, end);
-            (rows, (usize::MAX, usize::MAX), false, None)
-        };
+        let selection = self.selection_on_view();
+        let rows = self.term.rows();
+        let cursor = self.term.cursor().filter(|_| self.cursor_visible);
         // `canvas.draw()` invalidates the native surface itself; an extra
         // `invalidate_all()` would repaint again through the background-only
         // draw callback and wipe this frame.
         canvas.draw(|ctx| {
             render::draw_grid(
                 ctx,
-                &rows,
+                rows,
                 cursor,
-                cursor_visible,
                 &self.metrics,
                 &self.fonts,
                 &self.config.cursor.shape,

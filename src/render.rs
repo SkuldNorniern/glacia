@@ -15,57 +15,6 @@ use crate::config::CursorShape;
 use crate::theme;
 use crate::unicode::{compose_hangul_jamo, is_hangul_jamo};
 
-/// Zero-copy view over terminal grid rows, bridging the scrollback/screen split.
-///
-/// Avoids the `Vec<Vec<Cell>>` clone that would otherwise happen every rendered
-/// frame while the user is scrolled into scrollback history.
-pub struct CellRowsView<'a> {
-    sb: &'a [Vec<Cell>],
-    screen: &'a [Vec<Cell>],
-    start: usize,
-    len: usize,
-}
-
-impl<'a> CellRowsView<'a> {
-    /// View over the live screen only (scroll_offset == 0).
-    pub fn from_screen(screen: &'a [Vec<Cell>]) -> Self {
-        Self {
-            sb: &[],
-            screen,
-            start: 0,
-            len: screen.len(),
-        }
-    }
-
-    /// View over a window spanning both scrollback and screen (scroll_offset > 0).
-    pub fn from_split(
-        sb: &'a [Vec<Cell>],
-        screen: &'a [Vec<Cell>],
-        start: usize,
-        end: usize,
-    ) -> Self {
-        Self {
-            sb,
-            screen,
-            start,
-            len: end.saturating_sub(start),
-        }
-    }
-
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    pub fn get(&self, idx: usize) -> Option<&'a [Cell]> {
-        let i = self.start + idx;
-        if i < self.sb.len() {
-            Some(&self.sb[i])
-        } else {
-            self.screen.get(i - self.sb.len()).map(Vec::as_slice)
-        }
-    }
-}
-
 /// Normalized selection range in screen-cell coordinates.
 /// `start` is always ≤ `end` in row-major order after construction via [`SelectionRange::new`].
 #[derive(Clone, Copy)]
@@ -709,9 +658,8 @@ fn draw_row(
 #[allow(clippy::too_many_arguments)]
 pub fn draw_grid(
     ctx: &mut dyn DrawingContext,
-    rows: &CellRowsView<'_>,
-    cursor: (usize, usize),
-    cursor_visible: bool,
+    rows: &[Vec<Cell>],
+    cursor: Option<(usize, usize)>,
     metrics: &CellMetrics,
     fonts: &RowFonts,
     cursor_shape: &CursorShape,
@@ -720,10 +668,7 @@ pub fn draw_grid(
 ) -> AureaResult<()> {
     let line_h = metrics.height;
 
-    for row_idx in 0..rows.len() {
-        let Some(row) = rows.get(row_idx) else {
-            continue;
-        };
+    for (row_idx, row) in rows.iter().enumerate() {
         let y_top = layout.row_y(row_idx, metrics);
         let sel_cols = selection.and_then(|s| s.cols_for_row(row_idx, row.len()));
         draw_row(
@@ -738,9 +683,8 @@ pub fn draw_grid(
         )?;
     }
 
-    if cursor_visible {
-        let (row, col) = cursor;
-        if row < rows.len() {
+    if let Some((row, col)) = cursor {
+        {
             if let Some(cursor_row) = rows.get(row) {
                 let (cursor_col, cursor_width_cells) = cursor_cell_span(cursor_row, col);
                 let x = layout.cell_x(cursor_col, metrics);

@@ -9,6 +9,7 @@ mod input;
 mod platform;
 mod plugin;
 mod render;
+mod selection;
 mod terminal;
 mod theme;
 mod unicode;

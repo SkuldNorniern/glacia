@@ -5,25 +5,23 @@
 
 use std::ffi::OsString;
 use std::io;
+use std::time::Instant;
 
 use vanta::pty::SpawnConfig;
-use vanta::{Cell, Terminal};
+use vanta::{
+    Cell, CellKind, CursorStyle, Event, MouseProtocol, MouseTracking, Palette, Terminal, Window,
+};
 
 pub struct TerminalSession {
     term: Terminal,
     last_version: u64,
-    scrollback: Vec<Vec<Cell>>,
-    cells: Vec<Vec<Cell>>,
-    cursor: (usize, usize),
-    /// Cached terminal width so `sync` can clamp the cursor column when the
-    /// VT is in "pending wrap" state (cx == cols after filling the last cell).
+    /// What the view shows: `screen_rows` lines ending `back` lines above
+    /// the bottom. Only these lines are copied out of Vanta, never all of
+    /// scrollback.
+    view: Window,
+    back: usize,
     screen_cols: usize,
-    cursor_visible: bool,
-    is_alt_screen: bool,
-    bracketed_paste: bool,
-    application_cursor_keys: bool,
-    /// Lines dropped off the top of scrollback so far.
-    dropped: u64,
+    screen_rows: usize,
 }
 
 /// Overrides for the spawned shell. Empty `shell`/`working_directory` mean
@@ -55,98 +53,180 @@ impl TerminalSession {
             ..SpawnConfig::default()
         };
         let term = Terminal::spawn_notify(&config, wake)?;
+        let view = term.view(0, overrides.rows as usize);
         Ok(Self {
             term,
             last_version: 0,
-            scrollback: Vec::new(),
-            cells: Vec::new(),
-            cursor: (0, 0),
+            view,
+            back: 0,
             screen_cols: overrides.cols as usize,
-            cursor_visible: true,
-            is_alt_screen: false,
-            bracketed_paste: false,
-            application_cursor_keys: false,
-            dropped: 0,
+            screen_rows: overrides.rows as usize,
         })
     }
 
-    /// Refresh the cached snapshot if the terminal produced new output.
-    /// Returns whether the cache actually changed. Caches the visible screen
-    /// only, not scrollback, with the cursor row rebased to screen-relative —
-    /// scrollback viewport rendering is a near-term follow-up, not this slice.
-    pub fn sync(&mut self) -> bool {
-        // the version is one atomic load; a snapshot copies the screen and
-        // all of scrollback, so only take one when something changed
-        if self.term.version() == self.last_version {
-            return false;
+    /// Reads the view again when the shell wrote something or the view
+    /// moved. `back` is how far it is scrolled up; it is held inside
+    /// scrollback. Returns whether there was new output.
+    pub fn sync(&mut self, back: usize) -> bool {
+        let version = self.term.version();
+        let fresh = version != self.last_version;
+        if fresh || back != self.back {
+            self.view = self.term.view(back, self.screen_rows);
+            self.back = back.min(self.scrollback_len());
+            self.last_version = self.view.version;
         }
-        let snapshot = self.term.snapshot();
-        self.last_version = snapshot.version;
-        let (line, col) = snapshot.cursor;
-        // Vanta's cx reaches `cols` in "pending wrap" state (last column filled,
-        // wrap not yet triggered). Clamp so the cursor block stays on-screen.
-        let col = col.min(self.screen_cols.saturating_sub(1));
-        self.cursor = (line.saturating_sub(snapshot.scrollback.len()), col);
-        self.scrollback = snapshot.scrollback;
-        self.cells = snapshot.screen;
-        self.cursor_visible = snapshot.cursor_visible;
-        self.is_alt_screen = snapshot.is_alt_screen;
-        self.bracketed_paste = snapshot.bracketed_paste;
-        self.application_cursor_keys = snapshot.application_cursor_keys;
-        self.dropped = snapshot.dropped;
-        true
+        fresh
     }
 
-    pub fn cells(&self) -> &[Vec<Cell>] {
-        &self.cells
+    /// The lines on view, top first.
+    pub fn rows(&self) -> &[Vec<Cell>] {
+        &self.view.rows
     }
 
-    pub fn scrollback_rows(&self) -> &[Vec<Cell>] {
-        &self.scrollback
+    /// The line number of the top row on view.
+    pub fn first(&self) -> usize {
+        self.view.first
     }
 
-    pub fn cursor(&self) -> (usize, usize) {
-        self.cursor
+    /// Lines in scrollback, above the screen.
+    pub fn scrollback_len(&self) -> usize {
+        self.view.lines.saturating_sub(self.screen_rows)
+    }
+
+    /// The cursor's `(row, col)` on view, when it is on view. A cursor
+    /// waiting to wrap past the last column shows on that column.
+    pub fn cursor(&self) -> Option<(usize, usize)> {
+        let (line, col) = self.view.cursor;
+        let row = line.checked_sub(self.view.first)?;
+        (row < self.view.rows.len().max(self.screen_rows))
+            .then(|| (row, col.min(self.screen_cols.saturating_sub(1))))
+    }
+
+    /// Text of lines `first..=last`, from `start_col` on the first and up
+    /// to `end_col` on the last. Rows that wrapped join without a break.
+    pub fn text(
+        &self,
+        (first, start_col): (usize, usize),
+        (last, end_col): (usize, usize),
+    ) -> String {
+        let count = last.saturating_sub(first) + 1;
+        let window = self.term.window(first, count);
+        let mut out = String::new();
+        for (i, row) in window.rows.iter().enumerate() {
+            let from = if i == 0 { start_col } else { 0 };
+            let to = if i + 1 == count {
+                end_col + 1
+            } else {
+                usize::MAX
+            };
+            let mut line = String::new();
+            for cell in row.iter().take(to).skip(from) {
+                match &cell.kind {
+                    CellKind::Char(c) => line.push(*c),
+                    CellKind::Cluster(s) => line.push_str(s),
+                    CellKind::Empty => line.push(' '),
+                    CellKind::Continuation => {}
+                }
+            }
+            let wrapped = window.wrapped.get(i).copied().unwrap_or(false);
+            if wrapped {
+                out.push_str(&line);
+            } else {
+                out.push_str(line.trim_end_matches(' '));
+                if i + 1 < count {
+                    out.push('\n');
+                }
+            }
+        }
+        out
     }
 
     /// Whether the app has requested the cursor be shown (DECTCEM).
     /// TUI apps like vim hide it to avoid a second cursor block.
     pub fn app_cursor_visible(&self) -> bool {
-        self.cursor_visible
+        self.view.cursor_visible
+    }
+
+    /// The cursor shape the app asked for (DECSCUSR).
+    pub fn cursor_style(&self) -> CursorStyle {
+        self.view.cursor_style
     }
 
     /// Whether the terminal app is on the alternate screen (DECSET 47/1049).
     /// When true, Glacia's scrollback viewport should be suppressed — the app
     /// manages its own scrolling (vim, htop, less, etc.).
     pub fn is_alt_screen(&self) -> bool {
-        self.is_alt_screen
+        self.view.is_alt_screen
     }
 
     /// Whether bracketed paste mode (DECSET 2004) is enabled.
     /// When true, clipboard pastes must be wrapped in ESC[200~ … ESC[201~.
     pub fn bracketed_paste_enabled(&self) -> bool {
-        self.bracketed_paste
+        self.view.bracketed_paste
     }
 
-    /// Lines dropped off the top of scrollback so far. With the scrollback
-    /// length it tells how many lines arrived, even at the cap.
+    /// Lines dropped off the top of scrollback so far. With a line number
+    /// it makes a position that stays on the same text as lines drop.
     pub fn dropped(&self) -> u64 {
-        self.dropped
+        self.view.dropped
     }
 
     /// Whether the app asked for application cursor keys (DECCKM): arrows
     /// then go as `ESC O x`.
     pub fn application_cursor_keys(&self) -> bool {
-        self.application_cursor_keys
+        self.view.application_cursor_keys
+    }
+
+    pub fn mouse(&self) -> (MouseTracking, MouseProtocol) {
+        (self.view.mouse_tracking, self.view.mouse_protocol)
+    }
+
+    /// Whether the app wants to hear about focus in and out (DECSET 1004).
+    pub fn focus_tracking(&self) -> bool {
+        self.view.focus_tracking
+    }
+
+    /// Bumped when an app changes colours (OSC 4 / 10 / 11).
+    pub fn palette_version(&self) -> u64 {
+        self.view.palette_version
+    }
+
+    pub fn palette(&self) -> Palette {
+        self.term.palette()
+    }
+
+    /// The colours Glacia draws with, for apps that ask (vim does, over ssh,
+    /// to pick light or dark).
+    pub fn set_palette(&self, palette: Palette) {
+        self.term.set_palette(palette);
+    }
+
+    /// Bells and clipboard writes from the app.
+    pub fn take_events(&self) -> Vec<Event> {
+        self.term.take_events()
+    }
+
+    /// When a synchronized update stops holding the screen back; the loop
+    /// should wake by then.
+    pub fn sync_deadline(&self) -> Option<Instant> {
+        self.term.sync_deadline()
     }
 
     pub fn write_str(&self, s: &str) -> io::Result<()> {
         self.term.write_str(s)
     }
 
+    pub fn write_bytes(&self, bytes: &[u8]) -> io::Result<()> {
+        self.term.write_bytes(bytes)
+    }
+
     pub fn resize(&mut self, cols: u16, rows: u16) -> io::Result<()> {
         self.screen_cols = cols as usize;
-        self.term.resize(cols, rows)
+        self.screen_rows = rows as usize;
+        let result = self.term.resize(cols, rows);
+        self.view = self.term.view(self.back, self.screen_rows);
+        self.last_version = self.view.version;
+        result
     }
 
     pub fn is_running(&self) -> bool {
