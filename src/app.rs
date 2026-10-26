@@ -3,7 +3,7 @@
 
 use std::mem::take;
 use std::sync::Arc;
-use std::sync::mpsc::{TryRecvError, channel};
+use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::{Duration, Instant};
 
 use aurea::render::{Canvas, Color, DrawingContext, Paint, PaintStyle, Point, Rect};
@@ -12,7 +12,7 @@ use aurea::{clipboard_text, set_clipboard_text};
 
 use vanta::{Cell, CursorStyle, Event, MouseTracking};
 
-use crate::config::{Config, CursorShape, MAX_FONT_SIZE, MIN_FONT_SIZE};
+use crate::config::{self, Config, CursorShape, MAX_FONT_SIZE, MIN_FONT_SIZE};
 use crate::input::{self, TextInputNormalizer};
 use crate::mouse::{self, Kind};
 use crate::render::{self, CellMetrics, Layout, RowFonts, SelectionRange, TabLabel};
@@ -129,6 +129,11 @@ fn follow(term: &mut TerminalSession, scroll: &mut usize) -> bool {
     true
 }
 
+/// How long the visual bell shows.
+const FLASH_FOR: Duration = Duration::from_millis(150);
+/// How long a config problem stays on screen.
+const DIAGNOSTICS_FOR: Duration = Duration::from_secs(10);
+
 /// How often a shell whose output ended is checked for its exit.
 const REAP_EVERY: Duration = Duration::from_millis(50);
 
@@ -159,6 +164,14 @@ pub struct App {
     metrics: CellMetrics,
     fonts: RowFonts,
     diagnostics: Vec<String>,
+    /// When the banner goes away.
+    diagnostics_until: Option<Instant>,
+    /// New configs from the file watcher.
+    config_changes: Receiver<(Config, Option<String>)>,
+    /// The font in the config changed; remeasure with the canvas.
+    refont: bool,
+    /// When the visual bell began, while it shows.
+    flash: Option<Instant>,
     window_size: (u32, u32),
     layout: Layout,
     text_input: TextInputNormalizer,
@@ -207,6 +220,10 @@ impl App {
         diagnostics: Vec<String>,
     ) -> Self {
         let now = Instant::now();
+        let config_changes = config::watch({
+            let wake = Arc::clone(&wake);
+            move || wake()
+        });
         let mut app = Self {
             window_size: (config.window.width, config.window.height),
             base_font_size: config.font.size,
@@ -229,7 +246,11 @@ impl App {
             retitle: true,
             metrics,
             fonts,
+            diagnostics_until: (!diagnostics.is_empty()).then(|| now + DIAGNOSTICS_FOR),
             diagnostics,
+            config_changes,
+            refont: false,
+            flash: None,
             text_input: TextInputNormalizer::new(),
             scroll_offset: 0,
             selection: None,
@@ -301,8 +322,26 @@ impl App {
             if close {
                 return Ok(());
             }
+            self.take_config();
             if let Some(size) = self.zoom_to.take() {
                 self.set_font_size(size, canvas);
+            }
+            if take(&mut self.refont) {
+                self.remeasure(canvas);
+            }
+            // the bell's flash fades out over a few frames
+            if let Some(start) = self.flash {
+                if start.elapsed() < FLASH_FOR {
+                    self.needs_redraw = true;
+                } else {
+                    self.flash = None;
+                    self.needs_redraw = true;
+                }
+            }
+            if self.diagnostics_until.is_some_and(|t| Instant::now() >= t) {
+                self.diagnostics_until = None;
+                self.diagnostics.clear();
+                self.needs_redraw = true;
             }
             self.follow_canvas_size(canvas);
             self.pump_shell();
@@ -1293,12 +1332,46 @@ impl App {
         }
     }
 
+    /// A config the watcher read: applied when it parsed, else its error
+    /// shows and the config in force stays.
+    fn take_config(&mut self) {
+        let Some((config, problem)) = self.config_changes.try_iter().last() else {
+            return;
+        };
+        if let Some(problem) = problem {
+            self.diagnostics = vec![problem];
+            self.diagnostics_until = Some(Instant::now() + DIAGNOSTICS_FOR);
+            self.needs_redraw = true;
+            return;
+        }
+        let old = &self.config.font;
+        let font = &config.font;
+        self.refont |= old.family != font.family
+            || old.fallbacks != font.fallbacks
+            || old.size != font.size
+            || old.line_height != font.line_height;
+        let padding = self.config.window.padding != config.window.padding;
+        self.base_font_size = config.font.size;
+        self.config = config;
+        if padding {
+            self.refit();
+        }
+        self.diagnostics.clear();
+        self.wake_cursor();
+    }
+
     /// Remeasures the cells for a new font size and refits the grid.
     fn set_font_size(&mut self, size: f32, canvas: &Canvas) {
         if size == self.config.font.size {
             return;
         }
         self.config.font.size = size;
+        self.remeasure(canvas);
+    }
+
+    /// Builds the fonts again from the config and refits the grid to the
+    /// new cell size.
+    fn remeasure(&mut self, canvas: &Canvas) {
         self.fonts = row_fonts(&self.config);
         self.metrics = cell_metrics(&self.config, canvas, &mut self.fonts);
         let (w, h) = self.window_size;
@@ -1310,10 +1383,15 @@ impl App {
     /// here) when the config allows them.
     fn take_events(&mut self) {
         for event in self.term.take_events() {
-            if let Event::Clipboard(text) = event
-                && self.config.terminal.clipboard_write
-            {
-                let _ = set_clipboard_text(&text);
+            match event {
+                Event::Clipboard(text) if self.config.terminal.clipboard_write => {
+                    let _ = set_clipboard_text(&text);
+                }
+                Event::Bell if self.config.bell.visual => {
+                    self.flash = Some(Instant::now());
+                    self.needs_redraw = true;
+                }
+                _ => {}
             }
         }
     }
@@ -1487,6 +1565,22 @@ impl App {
                     )?;
                 }
                 caret = Some(Rect::new(x, y, self.metrics.width, self.metrics.height));
+            }
+            if let Some(start) = self.flash {
+                // a light wash over the pane, fading out
+                let left = 1.0 - start.elapsed().as_secs_f32() / FLASH_FOR.as_secs_f32();
+                if left > 0.0 {
+                    let (x, y, w, h) = self
+                        .areas
+                        .iter()
+                        .find(|a| a.0 == self.focused)
+                        .map_or((0.0, 0.0, 0.0, 0.0), |a| a.1);
+                    let alpha = (left * 40.0) as u8;
+                    ctx.draw_rect(
+                        Rect::new(x, y, w, h),
+                        &solid(Color::rgba(255, 255, 255, alpha)),
+                    )?;
+                }
             }
             if let Some(message) = self.diagnostics.first() {
                 render::draw_diagnostics_banner(

@@ -3,9 +3,12 @@
 //! never blocks startup — it falls back to defaults and reports a
 //! diagnostic instead.
 
-use std::fs::read_to_string;
 use std::fs::{create_dir_all, write as write_file};
+use std::fs::{metadata, read_to_string};
 use std::path::Path;
+use std::sync::mpsc::{Receiver, channel};
+use std::thread;
+use std::time::Duration;
 
 use toml::Table;
 use toml::Value;
@@ -123,6 +126,50 @@ pub struct Config {
     pub font: FontConfig,
     pub terminal: TerminalConfig,
     pub cursor: CursorConfig,
+    pub bell: BellConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct BellConfig {
+    /// A short flash over the pane when an app rings.
+    pub visual: bool,
+}
+
+impl Default for BellConfig {
+    fn default() -> Self {
+        Self { visual: true }
+    }
+}
+
+/// How often the config file is checked for changes.
+const WATCH_EVERY: Duration = Duration::from_secs(1);
+
+/// Watches the config file on a thread of its own; each time it changes,
+/// the new config comes through the channel and `wake` runs. A config that
+/// doesn't parse comes with its error and should be ignored. The thread
+/// ends with the receiver.
+pub fn watch(wake: impl Fn() + Send + 'static) -> Receiver<(Config, Option<String>)> {
+    let (tx, rx) = channel();
+    let Some(path) = platform::user_config_path() else {
+        return rx;
+    };
+    thread::spawn(move || {
+        let stamp = |p: &Path| metadata(p).and_then(|m| m.modified()).ok();
+        let mut seen = stamp(&path);
+        loop {
+            thread::sleep(WATCH_EVERY);
+            let now = stamp(&path);
+            if now == seen {
+                continue;
+            }
+            seen = now;
+            if tx.send(Config::load()).is_err() {
+                return;
+            }
+            wake();
+        }
+    });
+    rx
 }
 
 fn as_u32(v: Option<&Value>) -> Option<u32> {
@@ -217,6 +264,15 @@ impl Config {
             }
         }
 
+        if let Some(v) = table
+            .get("bell")
+            .and_then(Value::as_table)
+            .and_then(|bell| bell.get("visual"))
+            .and_then(Value::as_bool)
+        {
+            config.bell.visual = v;
+        }
+
         if let Some(cursor) = table.get("cursor").and_then(Value::as_table) {
             if let Some(v) = cursor.get("blink").and_then(Value::as_bool) {
                 config.cursor.blink = v;
@@ -301,6 +357,9 @@ fn write_default_template(path: &Path) -> Option<String> {
 # working_directory = \"\"  # empty = inherit current directory
 # clipboard_write   = true  # apps may set the clipboard (osc 52), never read it
 
+[bell]
+# visual = true  # a short flash when an app rings
+
 [cursor]
 # blink             = true
 # blink_interval_ms = 530
@@ -330,5 +389,21 @@ gpu = true"
             .render
             .gpu
         );
+    }
+
+    #[test]
+    fn bell_and_bounds_parse() {
+        let (config, error) = Config::parse_str(
+            "[bell]
+visual = false
+[font]
+size = 1000
+line_height = 0.1",
+        );
+        assert!(error.is_none());
+        assert!(!config.bell.visual);
+        assert_eq!(config.font.size, MAX_FONT_SIZE);
+        assert_eq!(config.font.line_height, 0.8);
+        assert!(Config::default().bell.visual);
     }
 }
