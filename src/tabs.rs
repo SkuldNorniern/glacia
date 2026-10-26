@@ -65,6 +65,41 @@ pub enum Node {
     },
 }
 
+/// An edge of a pane, where a dropped tab goes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Side {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+/// The edge of `area` nearest the point.
+pub fn side_of((x0, y0, w, h): Area, x: f32, y: f32) -> Side {
+    let fx = ((x - x0) / w.max(1.0)).clamp(0.0, 1.0);
+    let fy = ((y - y0) / h.max(1.0)).clamp(0.0, 1.0);
+    let edges = [
+        (fx, Side::Left),
+        (1.0 - fx, Side::Right),
+        (fy, Side::Top),
+        (1.0 - fy, Side::Bottom),
+    ];
+    edges
+        .iter()
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map_or(Side::Right, |e| e.1)
+}
+
+/// The half of `area` on `side`: where a tab dropped there would go.
+pub fn half((x, y, w, h): Area, side: Side) -> Area {
+    match side {
+        Side::Left => (x, y, (w / 2.0).floor(), h),
+        Side::Right => (x + (w / 2.0).floor(), y, w - (w / 2.0).floor(), h),
+        Side::Top => (x, y, w, (h / 2.0).floor()),
+        Side::Bottom => (x, y + (h / 2.0).floor(), w, h - (h / 2.0).floor()),
+    }
+}
+
 /// Where a split's dividing line is: its area, the split it belongs to
 /// (as a path of a/b turns from the root, false is `a`), and the area the
 /// split shares out.
@@ -179,6 +214,40 @@ impl Node {
             }
             Node::Leaf(_) => false,
             Node::Split { a, b, .. } => a.split(id, new, dir) || b.split(id, new, dir),
+        }
+    }
+
+    /// Puts `other` (a whole tab's panes) beside pane `target`, on `side`.
+    pub fn graft(&mut self, target: usize, other: Node, side: Side) -> bool {
+        match self {
+            Node::Leaf(leaf) if *leaf == target => {
+                let here = Node::Leaf(target);
+                let (dir, a, b) = match side {
+                    Side::Left => (Dir::Right, other, here),
+                    Side::Right => (Dir::Right, here, other),
+                    Side::Top => (Dir::Down, other, here),
+                    Side::Bottom => (Dir::Down, here, other),
+                };
+                *self = Node::split_of(dir, a, b);
+                true
+            }
+            Node::Leaf(_) => false,
+            Node::Split { a, b, .. } => {
+                if a.contains(target) {
+                    a.graft(target, other, side)
+                } else {
+                    b.graft(target, other, side)
+                }
+            }
+        }
+    }
+
+    /// Every split back to halves.
+    pub fn equalize(&mut self) {
+        if let Node::Split { ratio, a, b, .. } = self {
+            *ratio = 0.5;
+            a.equalize();
+            b.equalize();
         }
     }
 
@@ -455,5 +524,31 @@ mod tests {
         let areas = tree.areas((0.0, 0.0, 101.0, 101.0), 1.0);
         assert_eq!(areas[0].1.2, 25.0);
         assert_eq!(areas[1].1.3, 75.0);
+    }
+
+    #[test]
+    fn a_dropped_tab_goes_on_the_nearest_side() {
+        let area = (0.0, 0.0, 100.0, 50.0);
+        assert_eq!(side_of(area, 5.0, 25.0), Side::Left);
+        assert_eq!(side_of(area, 95.0, 25.0), Side::Right);
+        assert_eq!(side_of(area, 50.0, 3.0), Side::Top);
+        assert_eq!(side_of(area, 50.0, 48.0), Side::Bottom);
+        assert_eq!(half(area, Side::Right), (50.0, 0.0, 50.0, 50.0));
+        assert_eq!(half(area, Side::Top), (0.0, 0.0, 100.0, 25.0));
+    }
+
+    #[test]
+    fn grafting_puts_a_tab_beside_a_pane() {
+        let mut tree = Node::Leaf(0);
+        tree.split(0, 1, Dir::Right);
+        let mut other = Node::Leaf(5);
+        other.split(5, 6, Dir::Down);
+        assert!(tree.graft(1, other, Side::Top));
+        assert_eq!(tree.panes(), [0, 5, 6, 1]);
+        tree.nudge(0, Dir::Right, 0.2);
+        tree.equalize();
+        let areas = tree.areas((0.0, 0.0, 101.0, 101.0), 1.0);
+        assert_eq!(areas[0].1.2, 50.0, "back to halves");
+        assert!(!Node::Leaf(0).graft(9, Node::Leaf(1), Side::Left));
     }
 }

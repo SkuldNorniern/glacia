@@ -19,7 +19,7 @@ use crate::mouse::{self, Kind};
 use crate::render::{self, CellMetrics, Layout, RowFonts, SelectionRange, TabLabel};
 use crate::search::{RESEARCH_EVERY, Search};
 use crate::selection::{Selection, Spot, Unit};
-use crate::tabs::{self, Area, Bar, BarHit, Dir, Divider, Node, Pane, Spawner};
+use crate::tabs::{self, Area, Bar, BarHit, Dir, Divider, Node, Pane, Side, Spawner};
 use crate::terminal::TerminalSession;
 use crate::theme::{self, Colors};
 use crate::{cell_metrics, row_fonts};
@@ -162,6 +162,14 @@ pub struct App {
     bar_hover: Option<BarHit>,
     /// A tab being dragged: its index, and where in it it was grabbed.
     tab_drag: Option<(usize, f32)>,
+    /// Where the tab was pressed: a press that never moved is a click.
+    tab_press: (f64, f64),
+    /// The pane and side a dragged tab would join, shown as a preview.
+    drop_zone: Option<(usize, Side)>,
+    /// The pane with the keyboard fills its tab, the others hidden.
+    zoomed: bool,
+    /// The line between panes under the pointer, lit up.
+    divider_hover: Option<Vec<bool>>,
     /// Where each tab is drawn; tabs slide to their slot after a move.
     tab_x: Vec<f32>,
     spawn: Spawner,
@@ -252,6 +260,10 @@ impl App {
             bar_hover: None,
             link_hover: None,
             tab_drag: None,
+            tab_press: (0.0, 0.0),
+            drop_zone: None,
+            zoomed: false,
+            divider_hover: None,
             tab_x: vec![0.0],
             spawn,
             wake,
@@ -412,8 +424,13 @@ impl App {
         );
         let tree = &self.tabs[self.active].0;
         let padding = self.padding();
-        self.areas = tree
-            .areas(area, PANE_GAP)
+        let zoomed = self.zoomed && tree.contains(self.focused);
+        let areas = if zoomed {
+            vec![(self.focused, area)]
+        } else {
+            tree.areas(area, PANE_GAP)
+        };
+        self.areas = areas
             .into_iter()
             .map(|(id, (x, y, w, h))| {
                 let mut layout = Layout::new(w as u32, h as u32, &self.metrics, padding);
@@ -499,6 +516,7 @@ impl App {
         }
         // a held line belongs to the tab being left
         self.dragging = None;
+        self.zoomed = false;
         self.tabs[self.active].1 = self.focused;
         self.active = index;
         self.focus(self.tabs[index].1);
@@ -536,6 +554,7 @@ impl App {
 
     /// Splits the pane with the keyboard; the new one gets it.
     fn split(&mut self, dir: Dir) {
+        self.zoomed = false;
         // too small to hold two usable panes
         let (cols, rows) = (self.layout.cols, self.layout.rows);
         if (dir == Dir::Right && cols < 20) || (dir == Dir::Down && rows < 6) {
@@ -552,6 +571,7 @@ impl App {
     /// Closes pane `id` and its shell; a tab with no panes left closes
     /// too. False when it was the very last pane.
     fn close_pane(&mut self, id: usize) -> bool {
+        self.zoomed = false;
         // the tree a held line points into is about to change
         self.dragging = None;
         let Some(t) = self.tabs.iter().position(|(tree, _)| tree.contains(id)) else {
@@ -744,12 +764,31 @@ impl App {
 
     /// Moves the dragged tab with the pointer; passing the middle of a
     /// neighbour swaps their slots.
-    fn drag_tab(&mut self, x: f64) {
+    fn drag_tab(&mut self, x: f64, y: f64) {
         let Some((index, grab)) = self.tab_drag.filter(|(i, _)| *i < self.tabs.len()) else {
             self.tab_drag = None;
             return;
         };
         let bar = self.bar();
+        // below the bar, over a pane of the tab on show: a drop there joins
+        // the dragged tab to it as a split
+        if y as f32 > bar.height + 8.0 {
+            let zone = self
+                .pane_at(x, y)
+                .filter(|_| index != self.active)
+                .and_then(|id| {
+                    let area = self.areas.iter().find(|a| a.0 == id)?.1;
+                    Some((id, tabs::side_of(area, x as f32, y as f32)))
+                });
+            if zone != self.drop_zone {
+                self.drop_zone = zone;
+                self.needs_redraw = true;
+            }
+            return;
+        }
+        if self.drop_zone.take().is_some() {
+            self.needs_redraw = true;
+        }
         let max = bar.slot_x(bar.count.saturating_sub(1));
         let left = (x as f32 - grab).clamp(0.0, max);
         if let Some(shown) = self.tab_x.get_mut(index) {
@@ -761,11 +800,45 @@ impl App {
             self.tabs.insert(target, tab);
             let shown = self.tab_x.remove(index);
             self.tab_x.insert(target, shown);
-            // the dragged tab is the one on show
-            self.active = target;
+            // the tab on show keeps being shown, wherever it went
+            let active = self.active;
+            self.active = if active == index {
+                target
+            } else if index < active && active <= target {
+                active - 1
+            } else if target <= active && active < index {
+                active + 1
+            } else {
+                active
+            };
             self.tab_drag = Some((target, grab));
         }
-        self.bar_hover = Some(BarHit::Tab(self.active));
+        self.bar_hover = self.tab_drag.map(|(i, _)| BarHit::Tab(i));
+        self.needs_redraw = true;
+    }
+
+    /// The dragged tab let go: onto a pane it joins the tab on show as a
+    /// split; anywhere else it is shown.
+    fn drop_tab(&mut self) {
+        let Some((index, _)) = self.tab_drag.take() else {
+            return;
+        };
+        match self.drop_zone.take() {
+            Some((pane, side)) if index != self.active && index < self.tabs.len() => {
+                let (tree, last) = self.tabs.remove(index);
+                if index < self.tab_x.len() {
+                    self.tab_x.remove(index);
+                }
+                if index < self.active {
+                    self.active -= 1;
+                }
+                self.zoomed = false;
+                self.tabs[self.active].0.graft(pane, tree, side);
+                self.refit();
+                self.focus(last);
+            }
+            _ => self.switch_tab(index),
+        }
         self.needs_redraw = true;
     }
 
@@ -927,8 +1000,10 @@ impl App {
                 let bar = self.bar();
                 match (button, bar.hit(*x, *y)) {
                     (MouseButton::Left, Some(BarHit::Tab(i))) => {
-                        self.switch_tab(i);
+                        // shown on release, so a tab can be dragged onto
+                        // the one on show
                         self.tab_drag = Some((i, *x as f32 - bar.slot_x(i)));
+                        self.tab_press = (*x, *y);
                     }
                     // a second click of a double click lands on whatever slid
                     // under the pointer: only a fresh press closes or opens
@@ -949,11 +1024,8 @@ impl App {
                 button: MouseButton::Left,
                 pressed: false,
                 ..
-            } if self.tab_drag.is_some() => {
-                self.tab_drag = None;
-                self.needs_redraw = true;
-            }
-            WindowEvent::MouseMove { x, .. } if self.tab_drag.is_some() => self.drag_tab(*x),
+            } if self.tab_drag.is_some() => self.drop_tab(),
+            WindowEvent::MouseMove { x, y, .. } if self.tab_drag.is_some() => self.drag_tab(*x, *y),
             WindowEvent::MouseButton {
                 button: MouseButton::Left,
                 pressed: true,
@@ -1057,6 +1129,11 @@ impl App {
                     .map(|(row, a, b, _)| (row, a, b));
                 if link != self.link_hover {
                     self.link_hover = link;
+                    self.needs_redraw = true;
+                }
+                let line = self.divider_at(*x, *y).map(|d| d.path);
+                if line != self.divider_hover {
+                    self.divider_hover = line;
                     self.needs_redraw = true;
                 }
                 let hover = self.bar().hit(*x, *y);
@@ -1207,6 +1284,14 @@ impl App {
         } else if copy_paste && key == KeyCode::W {
             // the last pane stays: closing the window is the close button's job
             self.close_pane(self.focused);
+        } else if copy_paste && key == KeyCode::Z && self.tabs[self.active].0.panes().len() > 1 {
+            // ctrl+shift+z: the pane fills the tab, and back
+            self.zoomed = !self.zoomed;
+            self.refit();
+        } else if modifiers.alt && modifiers.shift && key == KeyCode::Key0 {
+            // alt+shift+0: every split back to halves
+            self.tabs[self.active].0.equalize();
+            self.refit();
         } else if modifiers.alt && modifiers.shift && key == KeyCode::Equals {
             self.split(Dir::Right);
         } else if modifiers.alt && modifiers.shift && key == KeyCode::Minus {
@@ -1700,6 +1785,58 @@ impl App {
                 &[],
                 &pane.colors,
             )?;
+            // the panes without the keyboard sit back a little
+            ctx.draw_rect(Rect::new(x, y, w, h), &solid(Color::rgba(0, 0, 0, 36)))?;
+        }
+        Ok(())
+    }
+
+    /// Over the panes: the line under the pointer (or being dragged) lit,
+    /// an outline on the pane with the keyboard, and where a dragged tab
+    /// would land.
+    fn draw_pane_marks(&self, ctx: &mut dyn DrawingContext) -> AureaResult<()> {
+        let (w, h) = self.window_size;
+        let bar = self.bar_height() as f32;
+        let area = (0.0, bar, w as f32, h as f32 - bar);
+        let lit = self
+            .dragging
+            .as_ref()
+            .map(|d| d.path.clone())
+            .or_else(|| self.divider_hover.clone());
+        if let Some(path) = lit.filter(|_| !self.zoomed) {
+            let tree = &self.tabs[self.active].0;
+            if let Some(line) = tree
+                .dividers(area, PANE_GAP)
+                .into_iter()
+                .find(|d| d.path == path)
+            {
+                let (lx, ly, lw, lh) = line.line;
+                let (lx, ly, lw, lh) = match line.dir {
+                    Dir::Right => (lx - 1.0, ly, lw + 2.0, lh),
+                    Dir::Down => (lx, ly - 1.0, lw, lh + 2.0),
+                };
+                ctx.draw_rect(Rect::new(lx, ly, lw, lh), &solid(theme::FOUND_CURRENT))?;
+            }
+        }
+        if self.areas.len() > 1
+            && let Some(&(_, (x, y, w, h), _)) = self.areas.iter().find(|a| a.0 == self.focused)
+        {
+            let accent = solid(Color::rgba(176, 112, 24, 150));
+            ctx.draw_rect(Rect::new(x, y, w, 1.0), &accent)?;
+            ctx.draw_rect(Rect::new(x, y + h - 1.0, w, 1.0), &accent)?;
+            ctx.draw_rect(Rect::new(x, y, 1.0, h), &accent)?;
+            ctx.draw_rect(Rect::new(x + w - 1.0, y, 1.0, h), &accent)?;
+        }
+        if let Some((pane, side)) = self.drop_zone
+            && let Some(&(_, area, _)) = self.areas.iter().find(|a| a.0 == pane)
+        {
+            let (x, y, w, h) = tabs::half(area, side);
+            ctx.draw_rect(Rect::new(x, y, w, h), &solid(Color::rgba(176, 112, 24, 60)))?;
+            let edge = solid(theme::FOUND_CURRENT);
+            ctx.draw_rect(Rect::new(x, y, w, 2.0), &edge)?;
+            ctx.draw_rect(Rect::new(x, y + h - 2.0, w, 2.0), &edge)?;
+            ctx.draw_rect(Rect::new(x, y, 2.0, h), &edge)?;
+            ctx.draw_rect(Rect::new(x + w - 2.0, y, 2.0, h), &edge)?;
         }
         Ok(())
     }
@@ -1746,6 +1883,7 @@ impl App {
                 &found,
                 &self.colors,
             )?;
+            self.draw_pane_marks(ctx)?;
             let bar = self.bar_height() as f32;
             if bar > 0.0 {
                 render::draw_tab_bar(
