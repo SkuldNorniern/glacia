@@ -7,10 +7,11 @@ use aurea::render::Canvas;
 use aurea::{AureaResult, KeyCode, Modifiers, MouseButton, Window, WindowEvent};
 use aurea::{clipboard_text, set_clipboard_text};
 
-use vanta::Cell;
+use vanta::{Cell, CursorStyle, MouseTracking};
 
-use crate::config::Config;
+use crate::config::{Config, CursorShape};
 use crate::input::{self, TextInputNormalizer};
+use crate::mouse::{self, Kind};
 use crate::render::{self, CellMetrics, Layout, RowFonts, SelectionRange};
 use crate::selection::{Selection, Spot, Unit};
 use crate::terminal::TerminalSession;
@@ -73,6 +74,13 @@ pub struct App {
     scroll_offset: usize,
     selection: Option<Selection>,
     mouse_dragging: bool,
+    /// The button an app is told is down, while it is, and the cell the
+    /// last report named, so motion is only told when it changes cell.
+    reported: Option<u8>,
+    reported_cell: Option<(usize, usize)>,
+    /// The `(row, col)` under the pointer, for wheel reports.
+    pointer: (usize, usize),
+    focused: bool,
     cursor_visible: bool,
     last_blink: Instant,
     /// When output last arrived; the cursor holds still until the shell has
@@ -109,6 +117,10 @@ impl App {
             scroll_offset: 0,
             selection: None,
             mouse_dragging: false,
+            reported: None,
+            reported_cell: None,
+            pointer: (0, 0),
+            focused: true,
             cursor_visible: true,
             last_blink: now,
             last_output: now,
@@ -149,7 +161,7 @@ impl App {
 
     /// How long until the cursor blinks next, or none when it doesn't.
     fn next_blink(&self) -> Option<Duration> {
-        if !self.config.cursor.blink {
+        if !self.blinks() {
             return None;
         }
         let blink = Duration::from_millis(self.config.cursor.blink_interval_ms);
@@ -238,25 +250,93 @@ impl App {
                     .unwrap_or(Instant::now());
             }
             WindowEvent::ScaleFactorChanged { .. } => self.needs_redraw = true,
+            WindowEvent::Focused | WindowEvent::Unfocused => {
+                self.focused = matches!(event, WindowEvent::Focused);
+                if self.term.focus_tracking() {
+                    let _ = self
+                        .term
+                        .write_str(if self.focused { "\x1b[I" } else { "\x1b[O" });
+                }
+                self.wake_cursor();
+            }
             WindowEvent::MouseButton {
-                button: MouseButton::Left,
+                button,
                 pressed,
                 x,
                 y,
+                modifiers,
                 click_count,
                 ..
-            } => self.on_left_button(*pressed, *x, *y, *click_count),
-            WindowEvent::MouseMove { x, y, .. } if self.mouse_dragging => self.on_drag(*x, *y),
+            } => {
+                let code = match button {
+                    MouseButton::Left => Some(mouse::LEFT),
+                    MouseButton::Middle => Some(mouse::MIDDLE),
+                    MouseButton::Right => Some(mouse::RIGHT),
+                    MouseButton::Other(_) => None,
+                };
+                let kind = if *pressed { Kind::Press } else { Kind::Release };
+                let told = code.is_some_and(|code| {
+                    // a release goes where its press went
+                    let to_app = if *pressed {
+                        self.app_takes_mouse(*modifiers)
+                    } else {
+                        self.reported.is_some()
+                    };
+                    to_app && self.report_mouse(code, kind, *modifiers, *x, *y)
+                });
+                if told {
+                    self.reported = (*pressed).then_some(code).flatten();
+                } else if *button == MouseButton::Left {
+                    self.on_left_button(*pressed, *x, *y, *click_count);
+                }
+            }
+            WindowEvent::MouseMove {
+                x, y, modifiers, ..
+            } => {
+                self.pointer = self.layout.cell_at(*x, *y, &self.metrics);
+                if self.mouse_dragging {
+                    self.on_drag(*x, *y);
+                } else if self.reported.is_some() || self.app_takes_mouse(*modifiers) {
+                    let button = self.reported.unwrap_or(mouse::NONE);
+                    self.report_mouse(button, Kind::Motion, *modifiers, *x, *y);
+                }
+            }
             WindowEvent::KeyInput {
                 key,
                 pressed: true,
                 modifiers,
             } => self.on_key(*key, *modifiers),
-            WindowEvent::MouseWheel { delta_y, .. } => self.on_wheel(*delta_y),
+            WindowEvent::MouseWheel {
+                delta_y, modifiers, ..
+            } => self.on_wheel(*delta_y, *modifiers),
             WindowEvent::TextInput { text } => self.on_text(text),
             _ => {}
         }
         false
+    }
+
+    /// Whether mouse input goes to the app: it asked for it and shift,
+    /// which always selects instead, isn't held.
+    fn app_takes_mouse(&self, mods: Modifiers) -> bool {
+        self.term.mouse().0 != MouseTracking::Off && !mods.shift
+    }
+
+    /// Tells the app about the mouse when its mode wants this. True when
+    /// the app took it.
+    fn report_mouse(&mut self, button: u8, kind: Kind, mods: Modifiers, x: f64, y: f64) -> bool {
+        let (tracking, protocol) = self.term.mouse();
+        if !mouse::wanted(tracking, kind, self.reported.is_some()) {
+            return tracking != MouseTracking::Off && kind == Kind::Motion;
+        }
+        let (row, col) = self.layout.cell_at(x, y, &self.metrics);
+        if kind == Kind::Motion && self.reported_cell == Some((row, col)) {
+            return true;
+        }
+        self.reported_cell = Some((row, col));
+        if let Some(bytes) = mouse::report(protocol, button, kind, mods, (col, row)) {
+            let _ = self.term.write_bytes(&bytes);
+        }
+        true
     }
 
     /// A press starts a selection: by cell, by word on a double click,
@@ -379,10 +459,26 @@ impl App {
         self.send(&bytes);
     }
 
-    fn on_wheel(&mut self, delta_y: f64) {
+    fn on_wheel(&mut self, delta_y: f64, mods: Modifiers) {
         let up = wheel_scrolls_up(delta_y);
         let lines = (delta_y.abs() * 3.0).ceil() as usize;
-        if self.term.is_alt_screen() {
+        if self.app_takes_mouse(mods) {
+            // tmux, vim and the rest with mouse on scroll themselves
+            let (_, protocol) = self.term.mouse();
+            let button = if up {
+                mouse::WHEEL_UP
+            } else {
+                mouse::WHEEL_DOWN
+            };
+            let at = self.pointer;
+            for _ in 0..lines.min(10) {
+                if let Some(bytes) =
+                    mouse::report(protocol, button, Kind::Press, mods, (at.1, at.0))
+                {
+                    let _ = self.term.write_bytes(&bytes);
+                }
+            }
+        } else if self.term.is_alt_screen() {
             // Wheel as arrow keys, the same sequences vim/less/htop get from
             // the keyboard.
             let seq = match (up, self.term.application_cursor_keys()) {
@@ -452,7 +548,7 @@ impl App {
                 self.term.sync(0);
             }
             self.update_title(window);
-        } else if self.config.cursor.blink
+        } else if self.blinks()
             && self.last_output.elapsed() >= blink
             && self.last_blink.elapsed() >= blink
         {
@@ -460,10 +556,39 @@ impl App {
             self.last_blink = Instant::now();
             self.needs_redraw = true;
         }
-        // TUI apps hide the cursor with DECTCEM and draw their own.
-        if !self.term.app_cursor_visible() {
-            self.cursor_visible = false;
+        if !self.blinks() && !self.cursor_visible {
+            // a blink stopped half way (focus left, the app set a steady
+            // shape): show it solid
+            self.cursor_visible = true;
+            self.needs_redraw = true;
         }
+    }
+
+    /// The app's DECSCUSR shape, else the configured one; an outline
+    /// while another window has the keyboard.
+    fn cursor_shape(&self) -> CursorShape {
+        if !self.focused {
+            return CursorShape::Hollow;
+        }
+        match self.term.cursor_style() {
+            CursorStyle::Default => self.config.cursor.shape.clone(),
+            CursorStyle::BlinkingBlock | CursorStyle::SteadyBlock => CursorShape::Block,
+            CursorStyle::BlinkingUnderline | CursorStyle::SteadyUnderline => CursorShape::Underline,
+            CursorStyle::BlinkingBar | CursorStyle::SteadyBar => CursorShape::Beam,
+        }
+    }
+
+    /// Whether the cursor blinks now: the config or the app says so, it
+    /// is shown at all, and the window has the keyboard.
+    fn blinks(&self) -> bool {
+        let wanted = match self.term.cursor_style() {
+            CursorStyle::Default => self.config.cursor.blink,
+            CursorStyle::BlinkingBlock
+            | CursorStyle::BlinkingUnderline
+            | CursorStyle::BlinkingBar => true,
+            _ => false,
+        };
+        wanted && self.focused && self.term.app_cursor_visible()
     }
 
     fn update_title(&mut self, window: &Window) {
@@ -487,7 +612,11 @@ impl App {
     fn draw(&mut self, canvas: &mut Canvas) -> AureaResult<()> {
         let selection = self.selection_on_view();
         let rows = self.term.rows();
-        let cursor = self.term.cursor().filter(|_| self.cursor_visible);
+        let cursor = self
+            .term
+            .cursor()
+            .filter(|_| self.cursor_visible && self.term.app_cursor_visible());
+        let shape = self.cursor_shape();
         // `canvas.draw()` invalidates the native surface itself; an extra
         // `invalidate_all()` would repaint again through the background-only
         // draw callback and wipe this frame.
@@ -498,7 +627,7 @@ impl App {
                 cursor,
                 &self.metrics,
                 &self.fonts,
-                &self.config.cursor.shape,
+                &shape,
                 &self.layout,
                 selection,
             )?;

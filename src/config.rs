@@ -70,6 +70,8 @@ pub enum CursorShape {
     Beam,
     /// Thin horizontal bar at the bottom of the cell.
     Underline,
+    /// An outline of the cell: the window doesn't have the keyboard.
+    Hollow,
 }
 
 #[derive(Debug, Clone)]

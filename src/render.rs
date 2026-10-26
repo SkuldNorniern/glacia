@@ -716,6 +716,13 @@ pub fn draw_grid(
                     CursorShape::Beam => {
                         ctx.draw_rect(Rect::new(x, y, 2.0, line_h), &solid(theme::CURSOR))?;
                     }
+                    CursorShape::Hollow => {
+                        let paint = solid(theme::CURSOR);
+                        ctx.draw_rect(Rect::new(x, y, cursor_width, 1.0), &paint)?;
+                        ctx.draw_rect(Rect::new(x, y + line_h - 1.0, cursor_width, 1.0), &paint)?;
+                        ctx.draw_rect(Rect::new(x, y, 1.0, line_h), &paint)?;
+                        ctx.draw_rect(Rect::new(x + cursor_width - 1.0, y, 1.0, line_h), &paint)?;
+                    }
                     CursorShape::Underline => {
                         ctx.draw_rect(
                             Rect::new(x, y + line_h - 2.0, cursor_width, 2.0),
