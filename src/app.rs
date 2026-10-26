@@ -8,12 +8,13 @@ use std::time::{Duration, Instant};
 
 use aurea::render::{Canvas, Color, DrawingContext, Paint, PaintStyle, Point, Rect};
 use aurea::{AureaResult, KeyCode, Modifiers, MouseButton, Window, WindowEvent};
-use aurea::{clipboard_text, reduced_motion, set_clipboard_text};
+use aurea::{clipboard_text, open_url, reduced_motion, set_clipboard_text};
 
 use vanta::{Cell, CursorStyle, Event, MouseTracking};
 
 use crate::config::{self, Config, CursorShape, MAX_FONT_SIZE, MIN_FONT_SIZE};
 use crate::input::{self, TextInputNormalizer};
+use crate::links;
 use crate::mouse::{self, Kind};
 use crate::render::{self, CellMetrics, Layout, RowFonts, SelectionRange, TabLabel};
 use crate::search::{RESEARCH_EVERY, Search};
@@ -154,6 +155,9 @@ pub struct App {
     areas: Vec<(usize, Area, Layout)>,
     /// A line between panes being dragged.
     dragging: Option<Divider>,
+    /// The link under the pointer while ctrl is held: row, first and last
+    /// column, underlined to say a click opens it.
+    link_hover: Option<(usize, usize, usize)>,
     /// What the pointer is over on the tab bar.
     bar_hover: Option<BarHit>,
     /// A tab being dragged: its index, and where in it it was grabbed.
@@ -246,6 +250,7 @@ impl App {
             areas: Vec::new(),
             dragging: None,
             bar_hover: None,
+            link_hover: None,
             tab_drag: None,
             tab_x: vec![0.0],
             spawn,
@@ -707,6 +712,18 @@ impl App {
         moved
     }
 
+    /// The link under a window point, in the pane with the keyboard: its
+    /// row, first and last column, and where it goes.
+    fn link_at(&self, x: f64, y: f64) -> Option<(usize, usize, usize, String)> {
+        if !self.layout.contains(x, y, &self.metrics) {
+            return None;
+        }
+        let (row, col) = self.layout.cell_at(x, y, &self.metrics);
+        let cells = self.term.rows().get(row)?;
+        let (a, b, url) = links::link_at(cells, col)?;
+        Some((row, a, b, url))
+    }
+
     /// The tab bar's layout now.
     fn bar(&self) -> Bar {
         Bar::new(
@@ -942,6 +959,19 @@ impl App {
                 pressed: true,
                 x,
                 y,
+                modifiers,
+                ..
+            } if modifiers.ctrl && !modifiers.shift && self.link_at(*x, *y).is_some() => {
+                // ctrl+click opens a link, before the app or a selection
+                if let Some((_, _, _, url)) = self.link_at(*x, *y) {
+                    let _ = open_url(&url);
+                }
+            }
+            WindowEvent::MouseButton {
+                button: MouseButton::Left,
+                pressed: true,
+                x,
+                y,
                 ..
             } if self.divider_at(*x, *y).is_some() => {
                 self.dragging = self.divider_at(*x, *y);
@@ -1020,6 +1050,15 @@ impl App {
                 x, y, modifiers, ..
             } => {
                 self.pointer = (*x, *y);
+                let link = modifiers
+                    .ctrl
+                    .then(|| self.link_at(*x, *y))
+                    .flatten()
+                    .map(|(row, a, b, _)| (row, a, b));
+                if link != self.link_hover {
+                    self.link_hover = link;
+                    self.needs_redraw = true;
+                }
                 let hover = self.bar().hit(*x, *y);
                 if hover != self.bar_hover {
                     self.bar_hover = hover;
@@ -1036,6 +1075,19 @@ impl App {
                         .find(|b| self.reported & (1 << b) != 0)
                         .unwrap_or(mouse::NONE);
                     self.report_mouse(button, Kind::Motion, *modifiers, *x, *y);
+                }
+            }
+            WindowEvent::KeyInput { modifiers, .. }
+                if !modifiers.ctrl && self.link_hover.take().is_some() =>
+            {
+                self.needs_redraw = true;
+                if let WindowEvent::KeyInput {
+                    key,
+                    pressed: true,
+                    modifiers,
+                } = event
+                {
+                    self.on_key(*key, *modifiers);
                 }
             }
             WindowEvent::KeyInput {
@@ -1736,6 +1788,22 @@ impl App {
                     )?;
                 }
                 caret = Some(Rect::new(x, y, self.metrics.width, self.metrics.height));
+            }
+            if let Some((row, a, b)) = self.link_hover {
+                let x = self.layout.cell_x(a, &self.metrics);
+                let w = self.layout.cell_x(b + 1, &self.metrics) - x;
+                let y = self.layout.row_y(row, &self.metrics)
+                    + self.metrics.baseline_offset
+                    + self.metrics.underline_offset;
+                ctx.draw_rect(
+                    Rect::new(
+                        x,
+                        y.round(),
+                        w,
+                        self.metrics.underline_thickness.round().max(1.0),
+                    ),
+                    &solid(theme::FOUND_CURRENT),
+                )?;
             }
             if let Some(start) = self.flash {
                 // a light wash over the pane, fading out

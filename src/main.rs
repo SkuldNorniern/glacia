@@ -6,6 +6,7 @@
 mod app;
 mod config;
 mod input;
+mod links;
 mod mouse;
 mod platform;
 mod plugin;
