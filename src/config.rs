@@ -22,6 +22,8 @@ pub struct WindowConfig {
     pub height: u32,
     /// Uniform padding in pixels between the window edge and the terminal grid.
     pub padding: u32,
+    /// Show the tab bar with one tab too, so its new tab button is there.
+    pub always_show_tabs: bool,
 }
 
 impl Default for WindowConfig {
@@ -30,6 +32,7 @@ impl Default for WindowConfig {
             width: 1280,
             height: 800,
             padding: 4,
+            always_show_tabs: false,
         }
     }
 }
@@ -226,6 +229,9 @@ impl Config {
             if let Some(v) = as_u32(window.get("padding")) {
                 config.window.padding = v.min(64);
             }
+            if let Some(v) = window.get("always_show_tabs").and_then(Value::as_bool) {
+                config.window.always_show_tabs = v;
+            }
         }
 
         if let Some(gpu) = table
@@ -351,6 +357,7 @@ fn write_default_template(path: &Path) -> Option<String> {
 # width   = 1280
 # height  = 800
 # padding = 4
+# always_show_tabs = false  # the tab bar with a single tab too
 
 [render]
 # gpu = false  # true draws on the GPU; it uses far more memory

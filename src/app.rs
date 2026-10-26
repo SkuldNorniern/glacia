@@ -443,7 +443,7 @@ impl App {
 
     /// The tab bar's height: none for a single tab.
     fn bar_height(&self) -> u32 {
-        if self.tabs.len() > 1 {
+        if self.tabs.len() > 1 || self.config.window.always_show_tabs {
             (self.metrics.height + 12.0).round() as u32
         } else {
             0
@@ -1007,7 +1007,7 @@ impl App {
                 x, y, modifiers, ..
             } => {
                 self.pointer = (*x, *y);
-                let hover = self.bar().hit(*x, *y).filter(|_| self.tabs.len() > 1);
+                let hover = self.bar().hit(*x, *y);
                 if hover != self.bar_hover {
                     self.bar_hover = hover;
                     self.needs_redraw = true;
@@ -1123,6 +1123,19 @@ impl App {
                 _ => self.base_font_size,
             };
             self.zoom_to = Some(next.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE));
+        } else if copy_paste && matches!(key, KeyCode::PageUp | KeyCode::PageDown) {
+            // ctrl+shift+pageup / pagedown move the tab left or right
+            let to = if key == KeyCode::PageUp {
+                self.active.checked_sub(1)
+            } else {
+                Some(self.active + 1).filter(|&i| i < self.tabs.len())
+            };
+            if let Some(to) = to {
+                self.tabs.swap(self.active, to);
+                self.tab_x.swap(self.active, to);
+                self.active = to;
+                self.needs_redraw = true;
+            }
         } else if copy_paste && key == KeyCode::T {
             self.new_tab();
         } else if copy_paste && key == KeyCode::W {
@@ -1493,7 +1506,8 @@ impl App {
             || old.fallbacks != font.fallbacks
             || old.size != font.size
             || old.line_height != font.line_height;
-        let padding = self.config.window.padding != config.window.padding;
+        let padding = self.config.window.padding != config.window.padding
+            || self.config.window.always_show_tabs != config.window.always_show_tabs;
         self.config = config;
         if padding {
             self.refit();
