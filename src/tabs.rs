@@ -264,18 +264,85 @@ pub fn neighbour(areas: &[(usize, Area)], from: usize, (dx, dy): (i8, i8)) -> Op
         .map(|(id, _)| id)
 }
 
-/// How wide each tab is drawn: equal shares, at most `max`.
-pub fn tab_width(window_width: f32, count: usize, max: f32) -> f32 {
-    (window_width / count.max(1) as f32)
-        .min(max)
-        .floor()
-        .max(1.0)
+/// Widest a tab is drawn.
+pub const TAB_MAX: f32 = 220.0;
+/// Narrowest a tab still shows its close button at.
+const CLOSE_MIN: f32 = 64.0;
+
+/// What is under the pointer on the tab bar.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BarHit {
+    Tab(usize),
+    Close(usize),
+    New,
 }
 
-/// The tab under `x`, if any.
-pub fn tab_at(x: f64, window_width: f32, count: usize, max: f32) -> Option<usize> {
-    let i = (x as f32 / tab_width(window_width, count, max)).floor();
-    (i >= 0.0 && (i as usize) < count).then_some(i as usize)
+/// Where things sit on the tab bar: tabs share the width left of the new
+/// tab button, each at most `TAB_MAX`.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Bar {
+    pub tab_w: f32,
+    pub count: usize,
+    pub height: f32,
+}
+
+impl Bar {
+    pub fn new(window_width: f32, count: usize, height: f32) -> Self {
+        let room = (window_width - height).max(1.0);
+        Self {
+            tab_w: (room / count.max(1) as f32).min(TAB_MAX).floor().max(1.0),
+            count,
+            height,
+        }
+    }
+
+    pub fn slot_x(&self, index: usize) -> f32 {
+        index as f32 * self.tab_w
+    }
+
+    /// The new tab button, right after the last tab.
+    pub fn new_button(&self) -> Area {
+        (self.slot_x(self.count), 0.0, self.height, self.height)
+    }
+
+    /// A tab's close button, when the tab is wide enough to hold one.
+    pub fn close_button(&self, x: f32) -> Option<Area> {
+        let size = (self.height * 0.6).round();
+        (self.tab_w >= CLOSE_MIN).then(|| {
+            (
+                x + self.tab_w - size - 6.0,
+                ((self.height - size) / 2.0).round(),
+                size,
+                size,
+            )
+        })
+    }
+
+    pub fn hit(&self, x: f64, y: f64) -> Option<BarHit> {
+        let (x, y) = (x as f32, y as f32);
+        let inside = |(ax, ay, w, h): Area| x >= ax && y >= ay && x < ax + w && y < ay + h;
+        if y < 0.0 || y >= self.height || x < 0.0 {
+            return None;
+        }
+        if inside(self.new_button()) {
+            return Some(BarHit::New);
+        }
+        let i = (x / self.tab_w).floor() as usize;
+        if i >= self.count {
+            return None;
+        }
+        match self.close_button(self.slot_x(i)) {
+            Some(close) if inside(close) => Some(BarHit::Close(i)),
+            _ => Some(BarHit::Tab(i)),
+        }
+    }
+
+    /// Where a tab dragged with its left edge at `x` drops: the slot its
+    /// middle is over.
+    pub fn drop_slot(&self, x: f32) -> usize {
+        let i = ((x + self.tab_w / 2.0) / self.tab_w).floor().max(0.0) as usize;
+        i.min(self.count.saturating_sub(1))
+    }
 }
 
 #[cfg(test)]
@@ -283,13 +350,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tabs_share_the_width_up_to_a_cap() {
-        assert_eq!(tab_width(1000.0, 2, 220.0), 220.0);
-        assert_eq!(tab_width(300.0, 3, 220.0), 100.0);
-        assert_eq!(tab_width(0.0, 3, 220.0), 1.0, "never zero");
-        assert_eq!(tab_at(450.0, 1000.0, 2, 220.0), None, "past the last tab");
-        assert_eq!(tab_at(230.0, 1000.0, 2, 220.0), Some(1));
-        assert_eq!(tab_at(-1.0, 1000.0, 2, 220.0), None);
+    fn the_bar_shares_its_width_and_finds_what_is_hit() {
+        let bar = Bar::new(1028.0, 2, 28.0);
+        assert_eq!(bar.tab_w, 220.0);
+        assert_eq!(bar.new_button(), (440.0, 0.0, 28.0, 28.0));
+        assert_eq!(bar.hit(10.0, 10.0), Some(BarHit::Tab(0)));
+        assert_eq!(bar.hit(230.0, 10.0), Some(BarHit::Tab(1)));
+        assert_eq!(bar.hit(420.0, 14.0), Some(BarHit::Close(1)));
+        assert_eq!(bar.hit(450.0, 10.0), Some(BarHit::New));
+        assert_eq!(bar.hit(600.0, 10.0), None, "empty bar");
+        assert_eq!(bar.hit(10.0, 40.0), None, "under the bar");
+        let tight = Bar::new(328.0, 6, 28.0);
+        assert_eq!(tight.tab_w, 50.0);
+        assert_eq!(
+            tight.close_button(0.0),
+            None,
+            "too narrow for a close button"
+        );
+        assert_eq!(Bar::new(0.0, 3, 28.0).tab_w, 1.0, "never zero");
+    }
+
+    #[test]
+    fn a_dragged_tab_drops_where_its_middle_is() {
+        let bar = Bar::new(1028.0, 3, 28.0);
+        assert_eq!(bar.drop_slot(0.0), 0);
+        assert_eq!(bar.drop_slot(100.0), 0);
+        assert_eq!(bar.drop_slot(120.0), 1);
+        assert_eq!(bar.drop_slot(-50.0), 0);
+        assert_eq!(bar.drop_slot(5000.0), 2);
     }
 
     #[test]

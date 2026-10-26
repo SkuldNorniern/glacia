@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use aurea::render::{Canvas, Color, DrawingContext, Paint, PaintStyle, Point, Rect};
 use aurea::{AureaResult, KeyCode, Modifiers, MouseButton, Window, WindowEvent};
-use aurea::{clipboard_text, set_clipboard_text};
+use aurea::{clipboard_text, reduced_motion, set_clipboard_text};
 
 use vanta::{Cell, CursorStyle, Event, MouseTracking};
 
@@ -18,7 +18,7 @@ use crate::mouse::{self, Kind};
 use crate::render::{self, CellMetrics, Layout, RowFonts, SelectionRange, TabLabel};
 use crate::search::{RESEARCH_EVERY, Search};
 use crate::selection::{Selection, Spot, Unit};
-use crate::tabs::{self, Area, Dir, Divider, Node, Pane, Spawner};
+use crate::tabs::{self, Area, Bar, BarHit, Dir, Divider, Node, Pane, Spawner};
 use crate::terminal::TerminalSession;
 use crate::theme::{self, Colors};
 use crate::{cell_metrics, row_fonts};
@@ -137,8 +137,6 @@ const DIAGNOSTICS_FOR: Duration = Duration::from_secs(10);
 /// How often a shell whose output ended is checked for its exit.
 const REAP_EVERY: Duration = Duration::from_millis(50);
 
-/// Widest a tab is drawn.
-const TAB_MAX: f32 = 220.0;
 /// The line between split panes.
 const PANE_GAP: f32 = 1.0;
 
@@ -156,6 +154,12 @@ pub struct App {
     areas: Vec<(usize, Area, Layout)>,
     /// A line between panes being dragged.
     dragging: Option<Divider>,
+    /// What the pointer is over on the tab bar.
+    bar_hover: Option<BarHit>,
+    /// A tab being dragged: its index, and where in it it was grabbed.
+    tab_drag: Option<(usize, f32)>,
+    /// Where each tab is drawn; tabs slide to their slot after a move.
+    tab_x: Vec<f32>,
     spawn: Spawner,
     wake: Wake,
     /// The window title wants another look: output came, or the tab or
@@ -241,6 +245,9 @@ impl App {
             active: 0,
             areas: Vec::new(),
             dragging: None,
+            bar_hover: None,
+            tab_drag: None,
+            tab_x: vec![0.0],
             spawn,
             wake,
             retitle: true,
@@ -331,6 +338,9 @@ impl App {
                 return Ok(());
             }
             self.take_config();
+            if self.slide_tabs() {
+                self.needs_redraw = true;
+            }
             if let Some(size) = self.zoom_to.take() {
                 self.set_font_size(size, canvas);
             }
@@ -510,6 +520,9 @@ impl App {
             return;
         };
         self.tabs.insert(self.active + 1, (Node::Leaf(id), id));
+        let from = self.tab_x.get(self.active).copied().unwrap_or(0.0);
+        self.tab_x
+            .insert((self.active + 1).min(self.tab_x.len()), from);
         self.switch_tab(self.active + 1);
         // the bar may have just shown up
         self.refit();
@@ -634,6 +647,7 @@ impl App {
 
     /// What the tab bar shows: each tab's title is its keyboard pane's.
     fn tab_labels(&self) -> Vec<TabLabel> {
+        let bar = self.bar();
         let label = |term: &TerminalSession| {
             term.title()
                 .map_or_else(|| "shell".to_owned(), |t| display_shell_name(&t).to_owned())
@@ -658,6 +672,10 @@ impl App {
                     text,
                     active: i == self.active,
                     bell,
+                    x: self.tab_x.get(i).copied().unwrap_or(bar.slot_x(i)),
+                    hover: matches!(self.bar_hover, Some(BarHit::Tab(h) | BarHit::Close(h)) if h == i),
+                    close_hover: self.bar_hover == Some(BarHit::Close(i)),
+                    dragged: self.tab_drag.is_some_and(|(d, _)| d == i),
                 }
             })
             .collect()
@@ -680,6 +698,71 @@ impl App {
             self.refit();
         }
         moved
+    }
+
+    /// The tab bar's layout now.
+    fn bar(&self) -> Bar {
+        Bar::new(
+            self.window_size.0 as f32,
+            self.tabs.len(),
+            self.bar_height() as f32,
+        )
+    }
+
+    /// Closes every pane of tab `i`.
+    fn close_tab(&mut self, i: usize) {
+        if let Some((tree, _)) = self.tabs.get(i) {
+            for id in tree.panes() {
+                self.close_pane(id);
+            }
+        }
+    }
+
+    /// Moves the dragged tab with the pointer; passing the middle of a
+    /// neighbour swaps their slots.
+    fn drag_tab(&mut self, x: f64) {
+        let Some((index, grab)) = self.tab_drag else {
+            return;
+        };
+        let bar = self.bar();
+        let max = bar.slot_x(bar.count.saturating_sub(1));
+        let left = (x as f32 - grab).clamp(0.0, max);
+        if let Some(shown) = self.tab_x.get_mut(index) {
+            *shown = left;
+        }
+        let target = bar.drop_slot(left);
+        if target != index && target < self.tabs.len() {
+            let tab = self.tabs.remove(index);
+            self.tabs.insert(target, tab);
+            let shown = self.tab_x.remove(index);
+            self.tab_x.insert(target, shown);
+            // the dragged tab is the one on show
+            self.active = target;
+            self.tab_drag = Some((target, grab));
+        }
+        self.needs_redraw = true;
+    }
+
+    /// Slides tabs toward their slots a step a frame. True while any moves.
+    fn slide_tabs(&mut self) -> bool {
+        let bar = self.bar();
+        self.tab_x.resize(self.tabs.len(), 0.0);
+        let still = reduced_motion();
+        let mut moving = false;
+        for (i, x) in self.tab_x.iter_mut().enumerate() {
+            if self.tab_drag.is_some_and(|(d, _)| d == i) {
+                continue;
+            }
+            let target = bar.slot_x(i);
+            let gap = target - *x;
+            if still || gap.abs() < 0.5 {
+                *x = target;
+            } else {
+                *x += gap * 0.35;
+                moving = true;
+            }
+        }
+        moving
     }
 
     /// The line between panes under a window point, a few pixels either
@@ -812,22 +895,35 @@ impl App {
                 pressed: true,
                 x,
                 y,
+                click_count,
                 ..
             } if (*y as f32) < self.bar_height() as f32 => {
-                let width = self.window_size.0 as f32;
-                if let Some(i) = tabs::tab_at(*x, width, self.tabs.len(), TAB_MAX) {
-                    match button {
-                        MouseButton::Left => self.switch_tab(i),
-                        MouseButton::Middle => {
-                            // every pane of that tab
-                            for id in self.tabs[i].0.panes() {
-                                self.close_pane(id);
-                            }
-                        }
-                        _ => {}
+                let bar = self.bar();
+                match (button, bar.hit(*x, *y)) {
+                    (MouseButton::Left, Some(BarHit::Tab(i))) => {
+                        self.switch_tab(i);
+                        self.tab_drag = Some((i, *x as f32 - bar.slot_x(i)));
                     }
+                    (MouseButton::Left, Some(BarHit::Close(i)))
+                    | (MouseButton::Middle, Some(BarHit::Tab(i) | BarHit::Close(i))) => {
+                        self.close_tab(i);
+                    }
+                    (MouseButton::Left, Some(BarHit::New)) => self.new_tab(),
+                    // a double click on the empty bar opens a tab too
+                    (MouseButton::Left, None) if *click_count == 2 => self.new_tab(),
+                    _ => {}
                 }
+                self.needs_redraw = true;
             }
+            WindowEvent::MouseButton {
+                button: MouseButton::Left,
+                pressed: false,
+                ..
+            } if self.tab_drag.is_some() => {
+                self.tab_drag = None;
+                self.needs_redraw = true;
+            }
+            WindowEvent::MouseMove { x, .. } if self.tab_drag.is_some() => self.drag_tab(*x),
             WindowEvent::MouseButton {
                 button: MouseButton::Left,
                 pressed: true,
@@ -911,6 +1007,11 @@ impl App {
                 x, y, modifiers, ..
             } => {
                 self.pointer = (*x, *y);
+                let hover = self.bar().hit(*x, *y).filter(|_| self.tabs.len() > 1);
+                if hover != self.bar_hover {
+                    self.bar_hover = hover;
+                    self.needs_redraw = true;
+                }
                 if self.mouse_dragging {
                     self.on_drag(*x, *y);
                 } else if self.reported != 0
@@ -1569,9 +1670,10 @@ impl App {
             if bar > 0.0 {
                 render::draw_tab_bar(
                     ctx,
+                    &self.bar(),
                     &self.tab_labels(),
-                    (self.window_size.0 as f32, bar),
-                    TAB_MAX,
+                    self.bar_hover == Some(BarHit::New),
+                    self.window_size.0 as f32,
                     &self.metrics,
                     &self.fonts,
                     &self.colors,

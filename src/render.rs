@@ -14,7 +14,7 @@ use vanta::{Cell, CellKind};
 
 use crate::config::CursorShape;
 use crate::search::Piece;
-use crate::tabs::tab_width;
+use crate::tabs::Bar;
 use crate::theme::{self, Colors};
 use crate::unicode::{compose_hangul_jamo, is_hangul_jamo};
 
@@ -826,73 +826,147 @@ pub fn draw_grid(
     Ok(())
 }
 
-/// One tab in the bar: its label, whether it is on show, and whether it
-/// rang while hidden.
+/// One tab in the bar.
 pub struct TabLabel {
     pub text: String,
     pub active: bool,
+    /// It rang while hidden.
     pub bell: bool,
+    /// Where it is drawn now; it slides there when tabs move.
+    pub x: f32,
+    pub hover: bool,
+    pub close_hover: bool,
+    pub dragged: bool,
 }
 
-/// The tab bar across the top, `height` tall; tabs share the width.
+/// The tab bar across the top: tabs, their close buttons, and the new tab
+/// button after them. A dragged tab draws last, lifted.
+#[allow(clippy::too_many_arguments)]
 pub fn draw_tab_bar(
     ctx: &mut dyn DrawingContext,
+    bar: &Bar,
     tabs: &[TabLabel],
-    (width, height): (f32, f32),
-    tab_max: f32,
+    new_hover: bool,
+    width: f32,
     metrics: &CellMetrics,
     fonts: &RowFonts,
     colors: &Colors,
 ) -> AureaResult<()> {
-    ctx.draw_rect(Rect::new(0.0, 0.0, width, height), &solid(theme::BAR))?;
-    let w = tab_width(width, tabs.len(), tab_max);
+    ctx.draw_rect(Rect::new(0.0, 0.0, width, bar.height), &solid(theme::BAR))?;
+    let order = tabs
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| !t.dragged)
+        .chain(tabs.iter().enumerate().filter(|(_, t)| t.dragged));
+    for (i, tab) in order {
+        draw_tab(ctx, bar, tab, i, tabs, metrics, fonts, colors)?;
+    }
+    // the new tab button: a plus
+    let (x, y, w, h) = bar.new_button();
+    let fg = if new_hover {
+        ctx.draw_round_rect(
+            Rect::new(x + 4.0, y + 4.0, w - 8.0, h - 8.0),
+            4.0,
+            &solid(theme::BAR_HOVER),
+        )?;
+        colors.foreground
+    } else {
+        theme::BAR_TEXT_DIM
+    };
+    let (cx, cy, arm) = (
+        (x + w / 2.0).round(),
+        (y + h / 2.0).round(),
+        (h * 0.2).round(),
+    );
+    ctx.draw_rect(Rect::new(cx - arm, cy - 0.5, 2.0 * arm, 1.5), &solid(fg))?;
+    ctx.draw_rect(Rect::new(cx - 0.5, cy - arm, 1.5, 2.0 * arm), &solid(fg))?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_tab(
+    ctx: &mut dyn DrawingContext,
+    bar: &Bar,
+    tab: &TabLabel,
+    i: usize,
+    tabs: &[TabLabel],
+    metrics: &CellMetrics,
+    fonts: &RowFonts,
+    colors: &Colors,
+) -> AureaResult<()> {
+    let (x, w, h) = (tab.x.round(), bar.tab_w, bar.height);
     let pad = 10.0;
-    let baseline = ((height - metrics.height) / 2.0 + metrics.baseline_offset).round();
-    for (i, tab) in tabs.iter().enumerate() {
-        let x = i as f32 * w;
-        if tab.active {
-            ctx.draw_rect(Rect::new(x, 0.0, w, height), &solid(colors.background))?;
-            ctx.draw_rect(Rect::new(x, 0.0, w, 2.0), &solid(theme::FOUND_CURRENT))?;
-        } else if i > 0 && !tabs[i - 1].active {
-            ctx.draw_rect(
-                Rect::new(x, height * 0.25, 1.0, height * 0.5),
-                &solid(theme::BAR_TEXT_DIM),
+    if tab.dragged {
+        ctx.draw_shadow(Rect::new(x, 0.0, w, h), 0.0, 8.0, Color::rgba(0, 0, 0, 110))?;
+    }
+    if tab.active || tab.dragged {
+        ctx.draw_rect(Rect::new(x, 0.0, w, h), &solid(colors.background))?;
+        ctx.draw_rect(Rect::new(x, 0.0, w, 2.0), &solid(theme::FOUND_CURRENT))?;
+    } else if tab.hover {
+        ctx.draw_rect(Rect::new(x, 0.0, w, h), &solid(theme::BAR_HOVER))?;
+    } else if i > 0 && !tabs[i - 1].active && !tabs[i - 1].hover {
+        ctx.draw_rect(Rect::new(x, h * 0.25, 1.0, h * 0.5), &solid(theme::DIVIDER))?;
+    }
+    let close = bar
+        .close_button(x)
+        .filter(|_| tab.active || tab.hover || tab.dragged);
+    let mut text = if tab.bell {
+        format!("• {}", tab.text)
+    } else {
+        tab.text.clone()
+    };
+    let slot = fonts.font_slot_for_chars(ctx, text.chars());
+    let font = fonts.pick(false, false, slot);
+    // cut long titles to the tab, with an ellipsis: grown from the start
+    // while it fits
+    let room = w - 2.0 * pad - close.map_or(0.0, |c| c.2 + 4.0);
+    if ctx
+        .measure_text(&text, font)
+        .is_ok_and(|m| m.advance > room)
+    {
+        let mut cut = String::from("…");
+        for c in text.chars() {
+            let mut next = cut.clone();
+            next.insert(next.len() - '…'.len_utf8(), c);
+            if ctx
+                .measure_text(&next, font)
+                .is_ok_and(|m| m.advance > room)
+            {
+                break;
+            }
+            cut = next;
+        }
+        text = cut;
+    }
+    let fg = if tab.active || tab.dragged {
+        colors.foreground
+    } else {
+        theme::BAR_TEXT_DIM
+    };
+    let baseline = ((h - metrics.height) / 2.0 + metrics.baseline_offset).round();
+    ctx.draw_text_with_font(&text, Point::new(x + pad, baseline), font, &solid(fg))?;
+    if let Some((cx, cy, cw, ch)) = close {
+        if tab.close_hover {
+            ctx.draw_round_rect(
+                Rect::new(cx, cy, cw, ch),
+                4.0,
+                &solid(theme::BAR_HOVER_STRONG),
             )?;
         }
-        let mut text = if tab.bell {
-            format!("• {}", tab.text)
-        } else {
-            tab.text.clone()
+        // an x from two short strokes
+        let (mx, my, arm) = (cx + cw / 2.0, cy + ch / 2.0, (cw * 0.22).round());
+        let stroke = Paint {
+            color: if tab.close_hover {
+                colors.foreground
+            } else {
+                theme::BAR_TEXT_DIM
+            },
+            style: PaintStyle::Stroke,
+            stroke_width: 1.4,
+            ..Default::default()
         };
-        let slot = fonts.font_slot_for_chars(ctx, text.chars());
-        let font = fonts.pick(false, false, slot);
-        // cut long titles to the tab, with an ellipsis: grown from the
-        // start while it fits
-        let room = w - 2.0 * pad;
-        if ctx
-            .measure_text(&text, font)
-            .is_ok_and(|m| m.advance > room)
-        {
-            let mut cut = String::from("…");
-            for c in text.chars() {
-                let mut next = cut.clone();
-                next.insert(next.len() - '…'.len_utf8(), c);
-                if ctx
-                    .measure_text(&next, font)
-                    .is_ok_and(|m| m.advance > room)
-                {
-                    break;
-                }
-                cut = next;
-            }
-            text = cut;
-        }
-        let fg = if tab.active {
-            colors.foreground
-        } else {
-            theme::BAR_TEXT_DIM
-        };
-        ctx.draw_text_with_font(&text, Point::new(x + pad, baseline), font, &solid(fg))?;
+        ctx.draw_line(mx - arm, my - arm, mx + arm, my + arm, &stroke)?;
+        ctx.draw_line(mx - arm, my + arm, mx + arm, my - arm, &stroke)?;
     }
     Ok(())
 }

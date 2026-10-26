@@ -17,6 +17,9 @@ pub const FOUND_CURRENT: Color = Color::rgb(176, 112, 24);
 /// the find bar.
 pub const BAR: Color = Color::rgb(34, 38, 48);
 pub const BAR_TEXT_DIM: Color = Color::rgb(130, 138, 152);
+/// a tab or button under the pointer, and a close button under it.
+pub const BAR_HOVER: Color = Color::rgb(44, 49, 61);
+pub const BAR_HOVER_STRONG: Color = Color::rgb(60, 66, 80);
 /// the line between split panes.
 pub const DIVIDER: Color = Color::rgb(52, 58, 72);
 
