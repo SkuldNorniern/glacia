@@ -10,6 +10,7 @@ mod mouse;
 mod platform;
 mod plugin;
 mod render;
+mod search;
 mod selection;
 mod terminal;
 mod theme;

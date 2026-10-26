@@ -13,6 +13,7 @@ use crate::config::{Config, CursorShape, MAX_FONT_SIZE, MIN_FONT_SIZE};
 use crate::input::{self, TextInputNormalizer};
 use crate::mouse::{self, Kind};
 use crate::render::{self, CellMetrics, Layout, RowFonts, SelectionRange};
+use crate::search::Search;
 use crate::selection::{Selection, Spot, Unit};
 use crate::terminal::TerminalSession;
 use crate::theme::Colors;
@@ -75,6 +76,8 @@ pub struct App {
     /// Rows scrolled back into history; 0 is the live screen.
     scroll_offset: usize,
     selection: Option<Selection>,
+    /// The find bar, while it is open.
+    search: Option<Search>,
     mouse_dragging: bool,
     /// The button an app is told is down, while it is, and the cell the
     /// last report named, so motion is only told when it changes cell.
@@ -130,6 +133,7 @@ impl App {
             text_input: TextInputNormalizer::new(),
             scroll_offset: 0,
             selection: None,
+            search: None,
             mouse_dragging: false,
             reported: 0,
             reported_cell: None,
@@ -449,6 +453,13 @@ impl App {
                 _ => self.base_font_size,
             };
             self.zoom_to = Some(next.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE));
+        } else if copy_paste && key == KeyCode::F {
+            if self.search.take().is_none() {
+                self.search = Some(Search::default());
+            }
+            self.needs_redraw = true;
+        } else if self.search.is_some() && self.on_search_key(key, modifiers) {
+            // the find bar took it
         } else if copy_paste && key == KeyCode::C {
             self.copy_selection();
         } else if copy_paste && key == KeyCode::V {
@@ -460,6 +471,69 @@ impl App {
             // scrollback is shift+page/home/end; plain ones go to the shell
             self.send_key(key, modifiers);
         }
+    }
+
+    /// Keys while the find bar is open: Enter steps to older matches,
+    /// Shift+Enter to newer ones, Escape closes. False for keys it leaves
+    /// alone (copy, zoom, scrollback).
+    fn on_search_key(&mut self, key: KeyCode, mods: Modifiers) -> bool {
+        let Some(search) = &mut self.search else {
+            return false;
+        };
+        match key {
+            KeyCode::Escape => self.search = None,
+            KeyCode::Enter => {
+                search.step(!mods.shift);
+                self.show_match();
+            }
+            KeyCode::Backspace => {
+                search.query.pop();
+                self.find();
+            }
+            KeyCode::V if mods.ctrl && mods.shift => {
+                if let Some(text) = clipboard_text() {
+                    let line = text.lines().next().unwrap_or_default().to_owned();
+                    search.query.push_str(&line);
+                    self.find();
+                }
+            }
+            _ if mods.ctrl || mods.alt => return false,
+            KeyCode::PageUp | KeyCode::PageDown | KeyCode::Home | KeyCode::End => return false,
+            // the rest are typed, as text input
+            _ => {}
+        }
+        self.needs_redraw = true;
+        true
+    }
+
+    /// Searches again for the query and shows the newest match.
+    fn find(&mut self) {
+        let Some(search) = &mut self.search else {
+            return;
+        };
+        let (dropped, found) = self.term.find_all(&search.query);
+        search.set_found(dropped, &found);
+        self.show_match();
+    }
+
+    /// Scrolls so the current match is on view, near the middle.
+    fn show_match(&mut self) {
+        let Some(((line, _), _)) = self.search.as_ref().and_then(Search::current) else {
+            return;
+        };
+        let Some(index) = line
+            .checked_sub(self.term.dropped())
+            .and_then(|l| usize::try_from(l).ok())
+        else {
+            return;
+        };
+        let rows = self.layout.rows;
+        let first = self.term.first();
+        if index < first || index >= first + rows {
+            let top = index.saturating_sub(rows / 2);
+            self.scroll_offset = self.term.scrollback_len().saturating_sub(top);
+        }
+        self.needs_redraw = true;
     }
 
     fn copy_selection(&self) {
@@ -571,6 +645,13 @@ impl App {
     }
 
     fn on_text(&mut self, text: &str) {
+        if let Some(search) = &mut self.search {
+            search
+                .query
+                .extend(text.chars().filter(|c| !c.is_control()));
+            self.find();
+            return;
+        }
         let printable: String = self
             .text_input
             .normalize(text)
@@ -712,6 +793,12 @@ impl App {
 
     fn draw(&mut self, canvas: &mut Canvas) -> AureaResult<()> {
         let selection = self.selection_on_view();
+        let top = self.term.dropped() + self.term.first() as u64;
+        let found = self
+            .search
+            .as_ref()
+            .map(|s| s.pieces(top, self.term.rows().len()))
+            .unwrap_or_default();
         let rows = self.term.rows();
         let cursor = self
             .term
@@ -734,8 +821,20 @@ impl App {
                 &shape,
                 &self.layout,
                 selection,
+                &found,
                 &self.colors,
             )?;
+            if let Some(search) = &self.search {
+                render::draw_find_bar(
+                    ctx,
+                    &search.query,
+                    search.count(),
+                    self.window_size.0 as f32,
+                    &self.metrics,
+                    &self.fonts,
+                    &self.colors,
+                )?;
+            }
             if let Some((row, col)) = self.term.cursor() {
                 let x = self.layout.cell_x(col, &self.metrics);
                 let y = self.layout.row_y(row, &self.metrics);

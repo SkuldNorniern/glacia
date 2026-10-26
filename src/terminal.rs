@@ -9,7 +9,8 @@ use std::time::Instant;
 
 use vanta::pty::SpawnConfig;
 use vanta::{
-    Cell, CellKind, CursorStyle, Event, MouseProtocol, MouseTracking, Palette, Terminal, Window,
+    Cell, CellKind, CursorStyle, Event, Found, MouseProtocol, MouseTracking, Palette, Terminal,
+    Window,
 };
 
 pub struct TerminalSession {
@@ -199,6 +200,11 @@ impl TerminalSession {
     /// to pick light or dark).
     pub fn set_palette(&self, palette: Palette) {
         self.term.set_palette(palette);
+    }
+
+    /// Every match of `needle`, with the dropped count they were found at.
+    pub fn find_all(&self, needle: &str) -> (u64, Vec<Found>) {
+        self.term.find_all(needle)
     }
 
     /// Bells and clipboard writes from the app.

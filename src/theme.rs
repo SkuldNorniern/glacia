@@ -11,6 +11,12 @@ pub const BACKGROUND: Color = Color::rgb(16, 18, 24);
 pub const FOREGROUND: Color = Color::rgb(216, 222, 233);
 pub const CURSOR: Color = Color::rgb(255, 255, 255);
 pub const SELECTION: Color = Color::rgb(58, 79, 138);
+/// search matches, and the current one.
+pub const FOUND: Color = Color::rgb(92, 76, 28);
+pub const FOUND_CURRENT: Color = Color::rgb(176, 112, 24);
+/// the find bar.
+pub const BAR: Color = Color::rgb(34, 38, 48);
+pub const BAR_TEXT_DIM: Color = Color::rgb(130, 138, 152);
 
 const ANSI16: [Color; 16] = [
     Color::rgb(27, 29, 36),    // black

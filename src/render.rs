@@ -13,6 +13,7 @@ use vanta::vt::Attrs;
 use vanta::{Cell, CellKind};
 
 use crate::config::CursorShape;
+use crate::search::Piece;
 use crate::theme::{self, Colors};
 use crate::unicode::{compose_hangul_jamo, is_hangul_jamo};
 
@@ -521,6 +522,7 @@ fn draw_row(
     fonts: &RowFonts,
     layout: &Layout,
     sel_cols: Option<(usize, usize)>,
+    found: &[(usize, usize, bool)],
     colors: &Colors,
 ) -> AureaResult<()> {
     let cx = |col: usize| layout.cell_x(col, metrics);
@@ -535,6 +537,18 @@ fn draw_row(
     for (i, cell) in row.iter().enumerate() {
         if let (_, Some(bg)) = resolve_pair(cell, colors) {
             ctx.draw_rect(cell_rect(i), &solid(bg))?;
+        }
+    }
+
+    // search matches under the selection
+    for &(a, b, current) in found {
+        let paint = solid(if current {
+            theme::FOUND_CURRENT
+        } else {
+            theme::FOUND
+        });
+        for i in a..=b.min(row.len().saturating_sub(1)) {
+            ctx.draw_rect(cell_rect(i), &paint)?;
         }
     }
 
@@ -722,13 +736,22 @@ pub fn draw_grid(
     cursor_shape: &CursorShape,
     layout: &Layout,
     selection: Option<SelectionRange>,
+    found: &[Piece],
     colors: &Colors,
 ) -> AureaResult<()> {
     let line_h = metrics.height;
+    let mut row_found = Vec::new();
 
     for (row_idx, row) in rows.iter().enumerate() {
         let y_top = layout.row_y(row_idx, metrics);
         let sel_cols = selection.and_then(|s| s.cols_for_row(row_idx, row.len()));
+        row_found.clear();
+        row_found.extend(
+            found
+                .iter()
+                .filter(|p| p.0 == row_idx)
+                .map(|&(_, a, b, current)| (a, b, current)),
+        );
         draw_row(
             ctx,
             row,
@@ -738,6 +761,7 @@ pub fn draw_grid(
             fonts,
             layout,
             sel_cols,
+            &row_found,
             colors,
         )?;
     }
@@ -794,6 +818,83 @@ pub fn draw_grid(
     }
 
     Ok(())
+}
+
+/// The find bar in the top right corner: the query with a caret, and
+/// where the current match is among all of them.
+pub fn draw_find_bar(
+    ctx: &mut dyn DrawingContext,
+    query: &str,
+    (current, total): (usize, usize),
+    window_width: f32,
+    metrics: &CellMetrics,
+    fonts: &RowFonts,
+    colors: &Colors,
+) -> AureaResult<()> {
+    let pad = 8.0;
+    let h = metrics.height + 2.0 * pad;
+    let w = (metrics.width * 36.0).min(window_width - 16.0).max(120.0);
+    let x = (window_width - w - 8.0).round();
+    let y = 8.0;
+    ctx.draw_shadow(Rect::new(x, y, w, h), 6.0, 10.0, Color::rgba(0, 0, 0, 90))?;
+    ctx.draw_round_rect(Rect::new(x, y, w, h), 6.0, &solid(theme::BAR))?;
+    let baseline = (y + pad + metrics.baseline_offset).round();
+    let count = if total == 0 && !query.is_empty() {
+        "no match".to_owned()
+    } else {
+        format!("{current}/{total}")
+    };
+    let count_w = ctx
+        .measure_text(&count, &fonts.primary)
+        .map_or(0.0, |m| m.advance);
+    ctx.draw_text_with_font(
+        &count,
+        Point::new((x + w - pad - count_w).round(), baseline),
+        &fonts.primary,
+        &solid(theme::BAR_TEXT_DIM),
+    )?;
+    let slot = fonts.font_slot_for_chars(ctx, query.chars());
+    let font = fonts.pick(false, false, slot);
+    let (shown, hint) = if query.is_empty() {
+        ("find", true)
+    } else {
+        (query, false)
+    };
+    // the end of a long query, where typing happens
+    let room = w - 3.0 * pad - count_w;
+    let mut start = 0;
+    while start < shown.len()
+        && ctx
+            .measure_text(&shown[start..], font)
+            .is_ok_and(|m| m.advance > room)
+    {
+        start += shown[start..].chars().next().map_or(1, char::len_utf8);
+    }
+    let shown = &shown[start..];
+    let text_x = (x + pad).round();
+    ctx.draw_text_with_font(
+        shown,
+        Point::new(text_x, baseline),
+        font,
+        &solid(if hint {
+            theme::BAR_TEXT_DIM
+        } else {
+            colors.foreground
+        }),
+    )?;
+    let caret_x = if hint {
+        text_x
+    } else {
+        text_x
+            + ctx
+                .measure_text(shown, font)
+                .map_or(0.0, |m| m.advance)
+                .round()
+    };
+    ctx.draw_rect(
+        Rect::new(caret_x, y + pad, 1.5, metrics.height),
+        &solid(colors.cursor),
+    )
 }
 
 /// Text an input method is still composing, over the cells at `at`:
