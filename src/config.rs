@@ -52,12 +52,25 @@ impl Default for FontConfig {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct TerminalConfig {
     /// Empty means the platform default shell.
     pub shell: String,
     /// Empty means inherit the current working directory.
     pub working_directory: String,
+    /// Whether apps may set the clipboard (OSC 52), as a remote vim or
+    /// tmux does on yank. They can never read it.
+    pub clipboard_write: bool,
+}
+
+impl Default for TerminalConfig {
+    fn default() -> Self {
+        Self {
+            shell: String::new(),
+            working_directory: String::new(),
+            clipboard_write: true,
+        }
+    }
 }
 
 /// Cursor rendering shape.
@@ -195,6 +208,9 @@ impl Config {
             if let Some(v) = terminal.get("working_directory").and_then(Value::as_str) {
                 v.clone_into(&mut config.terminal.working_directory);
             }
+            if let Some(v) = terminal.get("clipboard_write").and_then(Value::as_bool) {
+                config.terminal.clipboard_write = v;
+            }
         }
 
         if let Some(cursor) = table.get("cursor").and_then(Value::as_table) {
@@ -279,6 +295,7 @@ fn write_default_template(path: &Path) -> Option<String> {
 [terminal]
 # shell             = \"\"  # empty = OS default (cmd.exe on Windows, $SHELL on Unix)
 # working_directory = \"\"  # empty = inherit current directory
+# clipboard_write   = true  # apps may set the clipboard (osc 52), never read it
 
 [cursor]
 # blink             = true

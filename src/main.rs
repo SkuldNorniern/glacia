@@ -199,6 +199,7 @@ fn main() -> AureaResult<()> {
     };
     let (cols, rows) = grid_size(config.window.width, config.window.height, &metrics, padding);
     let _ = term.resize(cols, rows);
+    term.set_palette(theme::Colors::theme().palette());
 
     App::new(config, term, metrics, fonts, diagnostics).run(&window, &mut canvas)
 }

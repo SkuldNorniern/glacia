@@ -1,9 +1,11 @@
-//! Hardcoded "glacia-dark" palette. Becomes config/theme-file driven once the
-//! config loading task lands; until then these are the only colors Glacia
-//! knows about.
+//! The "glacia-dark" palette, and the colours a frame draws with once apps
+//! have changed some of it.
+
+use std::array::from_fn;
 
 use aurea::render::Color;
 use vanta::Color as TermColor;
+use vanta::Palette;
 
 pub const BACKGROUND: Color = Color::rgb(16, 18, 24);
 pub const FOREGROUND: Color = Color::rgb(216, 222, 233);
@@ -29,6 +31,62 @@ const ANSI16: [Color; 16] = [
     Color::rgb(255, 255, 255), // bright white
 ];
 
+/// The colours a frame draws with: the theme's, with whatever an app
+/// changed through OSC 4 / 10 / 11 / 12.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Colors {
+    pub background: Color,
+    pub foreground: Color,
+    pub cursor: Color,
+    pub selection: Color,
+    ansi: [Color; 256],
+}
+
+impl Colors {
+    pub fn theme() -> Self {
+        Self {
+            background: BACKGROUND,
+            foreground: FOREGROUND,
+            cursor: CURSOR,
+            selection: SELECTION,
+            ansi: from_fn(|i| xterm256(i as u8)),
+        }
+    }
+
+    /// The theme as vanta keeps it, so apps that ask get these colours.
+    pub fn palette(&self) -> Palette {
+        let rgb = |c: Color| (c.r, c.g, c.b);
+        Palette {
+            fg: rgb(self.foreground),
+            bg: rgb(self.background),
+            cursor: rgb(self.cursor),
+            ansi: self.ansi.map(rgb),
+        }
+    }
+
+    /// Colours after an app changed some.
+    pub fn from_palette(palette: &Palette) -> Self {
+        let color = |(r, g, b): (u8, u8, u8)| Color::rgb(r, g, b);
+        Self {
+            background: color(palette.bg),
+            foreground: color(palette.fg),
+            cursor: color(palette.cursor),
+            selection: SELECTION,
+            ansi: palette.ansi.map(color),
+        }
+    }
+
+    /// A cell colour as pixels; `default` is the slot's own (foreground or
+    /// background).
+    pub fn resolve(&self, color: TermColor, default: Color) -> Color {
+        match color {
+            TermColor::Default => default,
+            TermColor::Indexed(idx) => self.ansi[idx as usize],
+            TermColor::Rgb(r, g, b) => Color::rgb(r, g, b),
+        }
+    }
+}
+
 fn xterm256(idx: u8) -> Color {
     match idx {
         0..=15 => ANSI16[idx as usize],
@@ -44,12 +102,20 @@ fn xterm256(idx: u8) -> Color {
     }
 }
 
-/// Resolve a Vanta cell color to a renderer color, given the default to use
-/// for `Color::Default` (the terminal's foreground or background pen).
-pub fn resolve(color: TermColor, default: Color) -> Color {
-    match color {
-        TermColor::Default => default,
-        TermColor::Indexed(idx) => xterm256(idx),
-        TermColor::Rgb(r, g, b) => Color::rgb(r, g, b),
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_theme_goes_to_vanta_and_back() {
+        let colors = Colors::theme();
+        assert_eq!(Colors::from_palette(&colors.palette()), colors);
+        let palette = colors.palette();
+        assert_eq!(palette.bg, (16, 18, 24));
+        assert_eq!(palette.ansi[1], (255, 107, 107));
+        assert_eq!(
+            colors.resolve(TermColor::Indexed(196), FOREGROUND),
+            Color::rgb(255, 0, 0)
+        );
     }
 }

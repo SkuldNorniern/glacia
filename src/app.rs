@@ -7,7 +7,7 @@ use aurea::render::Canvas;
 use aurea::{AureaResult, KeyCode, Modifiers, MouseButton, Window, WindowEvent};
 use aurea::{clipboard_text, set_clipboard_text};
 
-use vanta::{Cell, CursorStyle, MouseTracking};
+use vanta::{Cell, CursorStyle, Event, MouseTracking};
 
 use crate::config::{Config, CursorShape};
 use crate::input::{self, TextInputNormalizer};
@@ -15,6 +15,7 @@ use crate::mouse::{self, Kind};
 use crate::render::{self, CellMetrics, Layout, RowFonts, SelectionRange};
 use crate::selection::{Selection, Spot, Unit};
 use crate::terminal::TerminalSession;
+use crate::theme::Colors;
 
 const FRAME_INTERVAL: Duration = Duration::from_micros(16_667); // 60 FPS render cap
 pub const DEFAULT_TITLE: &str = "Glacia";
@@ -81,6 +82,9 @@ pub struct App {
     /// The `(row, col)` under the pointer, for wheel reports.
     pointer: (usize, usize),
     focused: bool,
+    /// What the frame draws with, and the vanta palette version it is from.
+    colors: Colors,
+    palette_version: u64,
     cursor_visible: bool,
     last_blink: Instant,
     /// When output last arrived; the cursor holds still until the shell has
@@ -121,6 +125,8 @@ impl App {
             reported_cell: None,
             pointer: (0, 0),
             focused: true,
+            colors: Colors::theme(),
+            palette_version: 0,
             cursor_visible: true,
             last_blink: now,
             last_output: now,
@@ -140,6 +146,14 @@ impl App {
                 Some(FRAME_INTERVAL.saturating_sub(self.last_render.elapsed()))
             } else {
                 self.next_blink()
+            };
+            // a synchronized update that never ends still shows, on time
+            let timeout = match (timeout, self.term.sync_deadline()) {
+                (t, Some(end)) => {
+                    let left = end.saturating_duration_since(Instant::now());
+                    Some(t.map_or(left, |t| t.min(left)))
+                }
+                (t, None) => t,
             };
             let mut close = false;
             for event in window.wait_events(timeout) {
@@ -542,6 +556,11 @@ impl App {
             }
             self.wake_cursor();
             self.last_output = Instant::now();
+            self.take_events();
+            if self.term.palette_version() != self.palette_version {
+                self.palette_version = self.term.palette_version();
+                self.colors = Colors::from_palette(&self.term.palette());
+            }
             // A TUI app just started: show all of its screen.
             if self.term.is_alt_screen() && self.scroll_offset > 0 {
                 self.scroll_offset = 0;
@@ -561,6 +580,18 @@ impl App {
             // shape): show it solid
             self.cursor_visible = true;
             self.needs_redraw = true;
+        }
+    }
+
+    /// Clipboard writes from apps (OSC 52: yank in a remote vim lands
+    /// here) when the config allows them.
+    fn take_events(&mut self) {
+        for event in self.term.take_events() {
+            if let Event::Clipboard(text) = event
+                && self.config.terminal.clipboard_write
+            {
+                let _ = set_clipboard_text(&text);
+            }
         }
     }
 
@@ -620,6 +651,8 @@ impl App {
         // `canvas.draw()` invalidates the native surface itself; an extra
         // `invalidate_all()` would repaint again through the background-only
         // draw callback and wipe this frame.
+        // the margins follow an app that changed the background
+        canvas.set_background_color(self.colors.background);
         canvas.draw(|ctx| {
             render::draw_grid(
                 ctx,
@@ -630,6 +663,7 @@ impl App {
                 &shape,
                 &self.layout,
                 selection,
+                &self.colors,
             )?;
             if let Some(message) = self.diagnostics.first() {
                 render::draw_diagnostics_banner(

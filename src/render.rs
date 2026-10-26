@@ -12,7 +12,7 @@ use vanta::vt::Attrs;
 use vanta::{Cell, CellKind};
 
 use crate::config::CursorShape;
-use crate::theme;
+use crate::theme::{self, Colors};
 use crate::unicode::{compose_hangul_jamo, is_hangul_jamo};
 
 /// Normalized selection range in screen-cell coordinates.
@@ -410,18 +410,18 @@ fn dim_color(c: Color) -> Color {
 
 /// Resolve a cell's effective (fg, bg) pair, honoring reverse video.
 /// For DIM cells the foreground is further dimmed towards black.
-fn resolve_pair(cell: &Cell) -> (Color, Option<Color>) {
+fn resolve_pair(cell: &Cell, colors: &Colors) -> (Color, Option<Color>) {
     let (mut fg, bg) = if cell.attrs.contains(Attrs::INVERSE) {
         (
-            theme::resolve(cell.bg, theme::BACKGROUND),
-            Some(theme::resolve(cell.fg, theme::FOREGROUND)),
+            colors.resolve(cell.bg, colors.background),
+            Some(colors.resolve(cell.fg, colors.foreground)),
         )
     } else {
         let bg = match cell.bg {
             TermColor::Default => None,
-            other => Some(theme::resolve(other, theme::BACKGROUND)),
+            other => Some(colors.resolve(other, colors.background)),
         };
-        (theme::resolve(cell.fg, theme::FOREGROUND), bg)
+        (colors.resolve(cell.fg, colors.foreground), bg)
     };
     if cell.attrs.contains(Attrs::DIM) {
         fg = dim_color(fg);
@@ -511,6 +511,7 @@ fn draw_row(
     fonts: &RowFonts,
     layout: &Layout,
     sel_cols: Option<(usize, usize)>,
+    colors: &Colors,
 ) -> AureaResult<()> {
     let cx = |col: usize| layout.cell_x(col, metrics);
     let cell_rect = |col: usize| Rect::new(cx(col), y_top, cx(col + 1) - cx(col), metrics.height);
@@ -519,10 +520,10 @@ fn draw_row(
     // ctx.clear() — that "blank → draw" cycle is the primary cause of flicker.
     ctx.draw_rect(
         Rect::new(cx(0), y_top, cx(row.len()) - cx(0), metrics.height),
-        &solid(theme::BACKGROUND),
+        &solid(colors.background),
     )?;
     for (i, cell) in row.iter().enumerate() {
-        if let (_, Some(bg)) = resolve_pair(cell) {
+        if let (_, Some(bg)) = resolve_pair(cell, colors) {
             ctx.draw_rect(cell_rect(i), &solid(bg))?;
         }
     }
@@ -533,7 +534,7 @@ fn draw_row(
             if i >= row.len() {
                 break;
             }
-            ctx.draw_rect(cell_rect(i), &solid(theme::SELECTION))?;
+            ctx.draw_rect(cell_rect(i), &solid(colors.selection))?;
         }
     }
 
@@ -548,7 +549,7 @@ fn draw_row(
             i += 1;
             continue;
         }
-        let (fg, _) = resolve_pair(&row[i]);
+        let (fg, _) = resolve_pair(&row[i], colors);
         if let Some(mut raw) = cell_jamo_text(&row[i]) {
             let bold = row[i].attrs.contains(Attrs::BOLD);
             let italic = row[i].attrs.contains(Attrs::ITALIC);
@@ -559,7 +560,7 @@ fn draw_row(
                     i += 1;
                     continue;
                 }
-                if resolve_pair(&row[i]).0 != fg
+                if resolve_pair(&row[i], colors).0 != fg
                     || row[i].attrs.contains(Attrs::BOLD) != bold
                     || row[i].attrs.contains(Attrs::ITALIC) != italic
                 {
@@ -605,7 +606,7 @@ fn draw_row(
         push_cell_text(&mut text, &row[i]);
         i += 1;
         while i < row.len()
-            && resolve_pair(&row[i]).0 == fg
+            && resolve_pair(&row[i], colors).0 == fg
             && row[i].attrs.contains(Attrs::BOLD) == bold
             && row[i].attrs.contains(Attrs::ITALIC) == italic
             && fonts.font_slot_for_cell(ctx, &row[i]) == font_slot
@@ -638,13 +639,13 @@ fn draw_row(
         let w = cx(i + 1) - x;
         if cell.attrs.contains(Attrs::UNDERLINE) {
             let ul_color = match cell.underline_color {
-                TermColor::Default => resolve_pair(cell).0,
-                other => theme::resolve(other, theme::FOREGROUND),
+                TermColor::Default => resolve_pair(cell, colors).0,
+                other => colors.resolve(other, colors.foreground),
             };
             ctx.draw_rect(Rect::new(x, ul_y, w, 1.5), &solid(ul_color))?;
         }
         if cell.attrs.contains(Attrs::STRIKE) {
-            let (fg, _) = resolve_pair(cell);
+            let (fg, _) = resolve_pair(cell, colors);
             ctx.draw_rect(Rect::new(x, st_y, w, 1.0), &solid(fg))?;
         }
     }
@@ -665,6 +666,7 @@ pub fn draw_grid(
     cursor_shape: &CursorShape,
     layout: &Layout,
     selection: Option<SelectionRange>,
+    colors: &Colors,
 ) -> AureaResult<()> {
     let line_h = metrics.height;
 
@@ -680,6 +682,7 @@ pub fn draw_grid(
             fonts,
             layout,
             sel_cols,
+            colors,
         )?;
     }
 
@@ -695,7 +698,7 @@ pub fn draw_grid(
                     CursorShape::Block => {
                         ctx.draw_rect(
                             Rect::new(x, y, cursor_width, line_h),
-                            &solid(theme::CURSOR),
+                            &solid(colors.cursor),
                         )?;
                         if let Some(cell) = cursor_row.get(cursor_col) {
                             let text = composed_cell_text(cell);
@@ -703,7 +706,7 @@ pub fn draw_grid(
                                 let bold = cell.attrs.contains(Attrs::BOLD);
                                 let italic = cell.attrs.contains(Attrs::ITALIC);
                                 let font_slot = fonts.font_slot_for_chars(ctx, text.chars());
-                                let char_color = theme::resolve(cell.bg, theme::BACKGROUND);
+                                let char_color = colors.resolve(cell.bg, colors.background);
                                 ctx.draw_text_with_font(
                                     &text,
                                     Point::new(x.round(), (y + metrics.baseline_offset).round()),
@@ -714,10 +717,10 @@ pub fn draw_grid(
                         }
                     }
                     CursorShape::Beam => {
-                        ctx.draw_rect(Rect::new(x, y, 2.0, line_h), &solid(theme::CURSOR))?;
+                        ctx.draw_rect(Rect::new(x, y, 2.0, line_h), &solid(colors.cursor))?;
                     }
                     CursorShape::Hollow => {
-                        let paint = solid(theme::CURSOR);
+                        let paint = solid(colors.cursor);
                         ctx.draw_rect(Rect::new(x, y, cursor_width, 1.0), &paint)?;
                         ctx.draw_rect(Rect::new(x, y + line_h - 1.0, cursor_width, 1.0), &paint)?;
                         ctx.draw_rect(Rect::new(x, y, 1.0, line_h), &paint)?;
@@ -726,7 +729,7 @@ pub fn draw_grid(
                     CursorShape::Underline => {
                         ctx.draw_rect(
                             Rect::new(x, y + line_h - 2.0, cursor_width, 2.0),
-                            &solid(theme::CURSOR),
+                            &solid(colors.cursor),
                         )?;
                     }
                 }
