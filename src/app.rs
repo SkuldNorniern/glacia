@@ -519,6 +519,7 @@ impl App {
         let Some(id) = self.spawn_pane() else {
             return;
         };
+        self.tab_drag = None;
         self.tabs.insert(self.active + 1, (Node::Leaf(id), id));
         let from = self.tab_x.get(self.active).copied().unwrap_or(0.0);
         self.tab_x
@@ -576,6 +577,12 @@ impl App {
                     self.switch_tab(next);
                 }
                 self.tabs.remove(t);
+                if t < self.tab_x.len() {
+                    self.tab_x.remove(t);
+                }
+                // the pointer and a drag were over the old order
+                self.bar_hover = None;
+                self.tab_drag = None;
                 if t < self.active {
                     self.active -= 1;
                 }
@@ -721,7 +728,8 @@ impl App {
     /// Moves the dragged tab with the pointer; passing the middle of a
     /// neighbour swaps their slots.
     fn drag_tab(&mut self, x: f64) {
-        let Some((index, grab)) = self.tab_drag else {
+        let Some((index, grab)) = self.tab_drag.filter(|(i, _)| *i < self.tabs.len()) else {
+            self.tab_drag = None;
             return;
         };
         let bar = self.bar();
@@ -740,6 +748,7 @@ impl App {
             self.active = target;
             self.tab_drag = Some((target, grab));
         }
+        self.bar_hover = Some(BarHit::Tab(self.active));
         self.needs_redraw = true;
     }
 
@@ -904,11 +913,15 @@ impl App {
                         self.switch_tab(i);
                         self.tab_drag = Some((i, *x as f32 - bar.slot_x(i)));
                     }
-                    (MouseButton::Left, Some(BarHit::Close(i)))
-                    | (MouseButton::Middle, Some(BarHit::Tab(i) | BarHit::Close(i))) => {
+                    // a second click of a double click lands on whatever slid
+                    // under the pointer: only a fresh press closes or opens
+                    (MouseButton::Left, Some(BarHit::Close(i))) if *click_count <= 1 => {
                         self.close_tab(i);
                     }
-                    (MouseButton::Left, Some(BarHit::New)) => self.new_tab(),
+                    (MouseButton::Middle, Some(BarHit::Tab(i) | BarHit::Close(i))) => {
+                        self.close_tab(i);
+                    }
+                    (MouseButton::Left, Some(BarHit::New)) if *click_count <= 1 => self.new_tab(),
                     // a double click on the empty bar opens a tab too
                     (MouseButton::Left, None) if *click_count == 2 => self.new_tab(),
                     _ => {}
@@ -1131,6 +1144,7 @@ impl App {
                 Some(self.active + 1).filter(|&i| i < self.tabs.len())
             };
             if let Some(to) = to {
+                self.tab_drag = None;
                 self.tabs.swap(self.active, to);
                 self.tab_x.swap(self.active, to);
                 self.active = to;

@@ -305,10 +305,11 @@ impl Bar {
         (self.slot_x(self.count), 0.0, self.height, self.height)
     }
 
-    /// A tab's close button, when the tab is wide enough to hold one.
+    /// A tab's close button, when the tab is wide enough to hold one and
+    /// isn't the only tab (the last one stays).
     pub fn close_button(&self, x: f32) -> Option<Area> {
         let size = (self.height * 0.6).round();
-        (self.tab_w >= CLOSE_MIN).then(|| {
+        (self.tab_w >= CLOSE_MIN && self.count > 1).then(|| {
             (
                 x + self.tab_w - size - 6.0,
                 ((self.height - size) / 2.0).round(),
@@ -368,6 +369,11 @@ mod tests {
             "too narrow for a close button"
         );
         assert_eq!(Bar::new(0.0, 3, 28.0).tab_w, 1.0, "never zero");
+        assert_eq!(
+            Bar::new(1028.0, 1, 28.0).close_button(0.0),
+            None,
+            "the last tab stays"
+        );
     }
 
     #[test]
