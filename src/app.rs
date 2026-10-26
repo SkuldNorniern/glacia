@@ -288,6 +288,14 @@ impl App {
             } else {
                 self.next_blink()
             };
+            // a config problem leaves on time, idle or not
+            let timeout = match self.diagnostics_until {
+                Some(until) => {
+                    let left = until.saturating_duration_since(Instant::now());
+                    Some(timeout.map_or(left, |t| t.min(left)))
+                }
+                None => timeout,
+            };
             // a shell whose output ended but isn't reaped yet: look again soon
             let dying = self.term.closed() || self.panes.iter().flatten().any(|p| p.term.closed());
             let timeout = if dying {
@@ -474,6 +482,8 @@ impl App {
         if index == self.active || index >= self.tabs.len() {
             return;
         }
+        // a held line belongs to the tab being left
+        self.dragging = None;
         self.tabs[self.active].1 = self.focused;
         self.active = index;
         self.focus(self.tabs[index].1);
@@ -523,6 +533,8 @@ impl App {
     /// Closes pane `id` and its shell; a tab with no panes left closes
     /// too. False when it was the very last pane.
     fn close_pane(&mut self, id: usize) -> bool {
+        // the tree a held line points into is about to change
+        self.dragging = None;
         let Some(t) = self.tabs.iter().position(|(tree, _)| tree.contains(id)) else {
             return true;
         };
@@ -651,8 +663,27 @@ impl App {
             .collect()
     }
 
+    /// Alt+Shift+arrow: moves that way the line of the innermost split
+    /// holding the pane with the keyboard. False when there is no such line,
+    /// so the key goes to the app.
+    fn nudge_line(&mut self, key: KeyCode) -> bool {
+        let Some((dx, dy)) = arrow(key).filter(|_| self.areas.len() > 1) else {
+            return false;
+        };
+        let (dir, delta) = if dx != 0 {
+            (Dir::Right, f32::from(dx) * 0.05)
+        } else {
+            (Dir::Down, f32::from(dy) * 0.05)
+        };
+        let moved = self.tabs[self.active].0.nudge(self.focused, dir, delta);
+        if moved {
+            self.refit();
+        }
+        moved
+    }
+
     /// The line between panes under a window point, a few pixels either
-    /// side counting.
+    /// side counting, unless that side is a pane whose app takes the mouse.
     fn divider_at(&self, x: f64, y: f64) -> Option<Divider> {
         if self.areas.len() < 2 {
             return None;
@@ -661,6 +692,19 @@ impl App {
         let bar = self.bar_height() as f32;
         let area = (0.0, bar, w as f32, h as f32 - bar);
         let (x, y) = (x as f32, y as f32);
+        if let Some(id) = self.pane_at(x as f64, y as f64) {
+            let tracking = if id == self.focused {
+                self.term.mouse().0
+            } else {
+                match self.panes.get(id) {
+                    Some(Some(pane)) => pane.term.mouse().0,
+                    _ => MouseTracking::Off,
+                }
+            };
+            if tracking != MouseTracking::Off {
+                return None;
+            }
+        }
         let slack = 3.0;
         self.tabs[self.active]
             .0
@@ -987,18 +1031,8 @@ impl App {
             self.split(Dir::Right);
         } else if modifiers.alt && modifiers.shift && key == KeyCode::Minus {
             self.split(Dir::Down);
-        } else if let Some((dx, dy)) = arrow(key)
-            .filter(|_| modifiers.alt && modifiers.shift && !modifiers.ctrl && self.areas.len() > 1)
-        {
-            // alt+shift+arrows move the nearest line that way
-            let (dir, delta) = if dx != 0 {
-                (Dir::Right, f32::from(dx) * 0.05)
-            } else {
-                (Dir::Down, f32::from(dy) * 0.05)
-            };
-            if self.tabs[self.active].0.nudge(self.focused, dir, delta) {
-                self.refit();
-            }
+        } else if modifiers.alt && modifiers.shift && !modifiers.ctrl && self.nudge_line(key) {
+            // a line between panes moved
         } else if let Some(arrow) = arrow(key).filter(|_| {
             modifiers.alt && !modifiers.ctrl && !modifiers.shift && self.areas.len() > 1
         }) {
@@ -1344,6 +1378,14 @@ impl App {
             self.needs_redraw = true;
             return;
         }
+        let mut config = config;
+        // a zoom holds unless the file's own size changed
+        if config.font.size == self.base_font_size {
+            self.base_font_size = config.font.size;
+            config.font.size = self.config.font.size;
+        } else {
+            self.base_font_size = config.font.size;
+        }
         let old = &self.config.font;
         let font = &config.font;
         self.refont |= old.family != font.family
@@ -1351,7 +1393,6 @@ impl App {
             || old.size != font.size
             || old.line_height != font.line_height;
         let padding = self.config.window.padding != config.window.padding;
-        self.base_font_size = config.font.size;
         self.config = config;
         if padding {
             self.refit();

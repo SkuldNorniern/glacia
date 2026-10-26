@@ -201,8 +201,9 @@ impl Node {
         }
     }
 
-    /// Moves the line nearest pane `id` that runs across `dir` by `delta`
-    /// of its split's area. False when no such line holds the pane.
+    /// Moves by `delta` of its area the line of the innermost `dir` split
+    /// holding pane `id`: the line the pane shares with its closest
+    /// neighbour that way. False when no such split holds the pane.
     pub fn nudge(&mut self, id: usize, dir: Dir, delta: f32) -> bool {
         let Node::Split {
             dir: own,

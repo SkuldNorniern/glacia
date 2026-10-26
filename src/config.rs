@@ -146,8 +146,9 @@ const WATCH_EVERY: Duration = Duration::from_secs(1);
 
 /// Watches the config file on a thread of its own; each time it changes,
 /// the new config comes through the channel and `wake` runs. A config that
-/// doesn't parse comes with its error and should be ignored. The thread
-/// ends with the receiver.
+/// doesn't parse comes with its error and should be ignored. A missing
+/// file changes nothing. The thread ends at the first change after the
+/// receiver is gone, or with the process.
 pub fn watch(wake: impl Fn() + Send + 'static) -> Receiver<(Config, Option<String>)> {
     let (tx, rx) = channel();
     let Some(path) = platform::user_config_path() else {
@@ -163,6 +164,10 @@ pub fn watch(wake: impl Fn() + Send + 'static) -> Receiver<(Config, Option<Strin
                 continue;
             }
             seen = now;
+            // deleted or renamed: keep what is in force, don't write a new one
+            if now.is_none() {
+                continue;
+            }
             if tx.send(Config::load()).is_err() {
                 return;
             }
