@@ -182,8 +182,12 @@ fn as_u64(v: Option<&Value>) -> Option<u64> {
         .and_then(|i| u64::try_from(i).ok())
 }
 
+/// A number, written with a point or without (`size = 16` counts too).
 fn as_f32(v: Option<&Value>) -> Option<f32> {
-    v.and_then(Value::as_float).map(|f| f as f32)
+    let v = v?;
+    v.as_float()
+        .or_else(|| v.as_integer().map(|i| i as f64))
+        .map(|f| f as f32)
 }
 
 fn parse_font_fallbacks(value: &str) -> Vec<String> {
