@@ -342,10 +342,10 @@ impl App {
                 self.needs_redraw = true;
             }
             if let Some(size) = self.zoom_to.take() {
-                self.set_font_size(size, canvas);
+                self.set_font_size(size);
             }
             if take(&mut self.refont) {
-                self.remeasure(canvas);
+                self.remeasure();
             }
             // the bell's flash fades out over a few frames
             if let Some(start) = self.flash {
@@ -1531,19 +1531,19 @@ impl App {
     }
 
     /// Remeasures the cells for a new font size and refits the grid.
-    fn set_font_size(&mut self, size: f32, canvas: &Canvas) {
+    fn set_font_size(&mut self, size: f32) {
         if size == self.config.font.size {
             return;
         }
         self.config.font.size = size;
-        self.remeasure(canvas);
+        self.remeasure();
     }
 
     /// Builds the fonts again from the config and refits the grid to the
     /// new cell size.
-    fn remeasure(&mut self, canvas: &Canvas) {
+    fn remeasure(&mut self) {
         self.fonts = row_fonts(&self.config);
-        self.metrics = cell_metrics(&self.config, canvas, &mut self.fonts);
+        self.metrics = cell_metrics(&self.config, &self.fonts);
         let (w, h) = self.window_size;
         self.resize_grid(w, h);
         self.clear_selection();
@@ -1780,7 +1780,9 @@ mod tests {
             width: 10.0,
             height: 20.0,
             baseline_offset: 16.0,
-            ascent: 16.0,
+            underline_offset: 2.0,
+            underline_thickness: 1.0,
+            strike_offset: 5.0,
         }
     }
 

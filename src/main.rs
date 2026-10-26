@@ -19,7 +19,7 @@ mod unicode;
 
 use std::sync::{Arc, OnceLock};
 
-use aurea::render::{Canvas, Font, RendererBackend};
+use aurea::render::{Canvas, Font, FontMetrics, RendererBackend, font_metrics, measure_text};
 use aurea::window::WindowProxy;
 use aurea::{AureaResult, Window, WindowEvent};
 
@@ -28,46 +28,35 @@ use config::Config;
 use render::{CellMetrics, RowFonts};
 use terminal::{SpawnOverrides, TerminalSession};
 
-/// Cell sizes guessed from the config alone, before a font is measured.
-fn estimated_metrics(config: &Config) -> CellMetrics {
-    let height = config.font.size * config.font.line_height;
-    CellMetrics {
-        width: config.font.size * 0.6,
-        height,
-        baseline_offset: height * 0.8,
-        ascent: height * 0.8,
-    }
-}
-
-/// Measure font metrics and build the cell sizing struct.
-///
-/// Width comes from the actual advance of 'M' so the cursor stays aligned with
-/// the rendered glyphs. Height and baseline_offset come from the font's true
-/// ascent+descent rather than a fixed fraction, preventing the last row's
-/// descenders from being clipped at the canvas edge. Also probes which
-/// codepoints the primary font lacks so fallback routing is automatic.
-fn cell_metrics(config: &Config, canvas: &Canvas, row_fonts: &mut RowFonts) -> CellMetrics {
-    let mut metrics = estimated_metrics(config);
-    let _ = canvas.clone().draw(|ctx| {
-        if let Ok(m) = ctx.measure_text("M", &row_fonts.primary) {
-            if m.ascent > 0.0 {
-                let font_h = m.ascent + m.descent;
-                // whole-pixel rows: every row edge and baseline lands on a
-                // pixel, so lines stay sharp and evenly spaced
-                let height = (font_h * config.font.line_height).round().max(1.0);
-                // the line_height gap split evenly above and below the glyph
-                metrics.baseline_offset = ((height - font_h) / 2.0 + m.ascent).round();
-                metrics.height = height;
-                metrics.ascent = m.ascent;
-            }
-            if m.advance > 0.0 {
-                metrics.width = m.advance;
-            }
-        }
-        row_fonts.probe(ctx, metrics.width);
-        Ok(())
+/// Cell sizes from the font itself (aurea `font_metrics`, no canvas
+/// needed). A row is the face's ascent, descent and line gap, the way
+/// alacritty and kitty size it, times `line_height`; the room it adds goes
+/// half above, half below. Cells are as wide as `M`.
+fn cell_metrics(config: &Config, fonts: &RowFonts) -> CellMetrics {
+    let size = config.font.size;
+    let face = font_metrics(&fonts.primary).unwrap_or(FontMetrics {
+        ascent: size * 0.8,
+        descent: size * 0.2,
+        underline_offset: size / 10.0,
+        underline_thickness: (size / 14.0).max(1.0),
+        ..FontMetrics::default()
     });
-    metrics
+    let natural = face.ascent + face.descent + face.line_gap;
+    let height = (natural * config.font.line_height).round().max(1.0);
+    let baseline_offset = ((height - face.ascent - face.descent) / 2.0 + face.ascent).round();
+    let width = measure_text("M", &fonts.primary)
+        .map(|m| m.advance)
+        .ok()
+        .filter(|w| *w > 0.0)
+        .unwrap_or(size * 0.6);
+    CellMetrics {
+        width,
+        height,
+        baseline_offset,
+        underline_offset: face.underline_offset.max(1.0),
+        underline_thickness: face.underline_thickness,
+        strike_offset: face.x_height.unwrap_or(face.ascent * 0.7) / 2.0,
+    }
 }
 
 /// A canvas on `backend`, set as the window's content.
@@ -150,12 +139,10 @@ fn main() -> AureaResult<()> {
         config.terminal.shell.clone()
     };
     let padding = config.window.padding;
-    let (cols, rows) = grid_size(
-        config.window.width,
-        config.window.height,
-        &estimated_metrics(&config),
-        padding,
-    );
+    // measured before the shell starts, so it starts at its real size
+    let fonts = row_fonts(&config);
+    let metrics = cell_metrics(&config, &fonts);
+    let (cols, rows) = grid_size(config.window.width, config.window.height, &metrics, padding);
     // On macOS, fork() after GUI/canvas/font runtime initialization can leave
     // the child in a bad state. Spawn the PTY first, then resize it after exact
     // font metrics are known.
@@ -195,18 +182,14 @@ fn main() -> AureaResult<()> {
     )?;
     let _ = proxy.set(window.proxy());
     let mut canvas = open_canvas(&mut window, &config)?;
-    let mut fonts = row_fonts(&config);
-    let metrics = cell_metrics(&config, &canvas, &mut fonts);
 
-    let mut term = match term {
+    let term = match term {
         Ok(term) => term,
         Err(err) => {
             let message = format!("failed to spawn default shell: {err}");
             return wait_for_close_with_message(&window, &canvas, &fonts.primary, &message);
         }
     };
-    let (cols, rows) = grid_size(config.window.width, config.window.height, &metrics, padding);
-    let _ = term.resize(cols, rows);
     term.set_palette(theme::Colors::theme().palette());
 
     let wake: app::Wake = Arc::new(move || {

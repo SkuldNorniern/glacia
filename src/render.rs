@@ -4,6 +4,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use aurea::AureaResult;
+use aurea::render::font_covers;
 use aurea::render::{
     Color, DrawingContext, Font, FontStyle, FontWeight, LineJoin, Paint, PaintStyle, Path,
     PathCommand, Point, Rect,
@@ -60,8 +61,12 @@ pub struct CellMetrics {
     /// Distance from the top of a cell row to the text baseline, derived from
     /// the actual font ascent rather than a fixed fraction of `height`.
     pub baseline_offset: f32,
-    /// Raw font ascent (pixels), used to position underline and strikethrough.
-    pub ascent: f32,
+    /// Below the baseline to the underline's top, and its thickness, as the
+    /// face says.
+    pub underline_offset: f32,
+    pub underline_thickness: f32,
+    /// Above the baseline to the middle of a strikethrough.
+    pub strike_offset: f32,
 }
 
 /// most cells a side; a tiny font in a huge window can't ask for more.
@@ -126,9 +131,8 @@ impl Layout {
 /// their fallback counterparts for CJK/emoji runs.
 ///
 /// Built once from the loaded `Font` objects and reused every frame — avoids
-/// cloning font family strings on the hot path. Call [`RowFonts::probe`] inside
-/// a canvas draw closure after construction to auto-detect characters the
-/// primary font cannot render.
+/// cloning font family strings on the hot path. Which face draws a char is
+/// asked of the faces themselves and cached.
 pub struct RowFonts {
     pub primary: Font,
     bold: Font,
@@ -136,7 +140,6 @@ pub struct RowFonts {
     bold_italic: Font,
     fallbacks: Vec<FontSet>,
     support_cache: RefCell<HashMap<(usize, u32), bool>>,
-    notdef_cache: RefCell<HashMap<usize, Option<f32>>>,
 }
 
 struct FontSet {
@@ -187,32 +190,6 @@ impl RowFonts {
             bold_italic,
             fallbacks,
             support_cache: RefCell::new(HashMap::new()),
-            notdef_cache: RefCell::new(HashMap::new()),
-        }
-    }
-
-    /// Prime glyph-support caches for common terminal and multilingual text.
-    /// Any character not listed here is still resolved lazily during drawing.
-    pub fn probe(&self, ctx: &mut dyn DrawingContext, _cell_width: f32) {
-        for ch in [
-            '\u{2500}',
-            '\u{2502}',
-            '\u{250C}',
-            '\u{2510}',
-            '\u{2514}',
-            '\u{2518}',
-            '\u{2588}',
-            '\u{2591}',
-            '\u{28FF}',
-            '\u{2713}',
-            '\u{03BB}',
-            '\u{D55C}',
-            '\u{AE00}',
-            '\u{8A9E}',
-            '\u{3042}',
-            '\u{1F642}',
-        ] {
-            let _ = self.font_slot_for_chars(ctx, [ch]);
         }
     }
 
@@ -234,15 +211,15 @@ impl RowFonts {
         }
     }
 
-    fn font_slot_for_cell(&self, ctx: &mut dyn DrawingContext, cell: &Cell) -> usize {
+    fn font_slot_for_cell(&self, cell: &Cell) -> usize {
         match &cell.kind {
-            CellKind::Char(c) => self.font_slot_for_chars(ctx, [*c]),
-            CellKind::Cluster(s) => self.font_slot_for_chars(ctx, s.chars()),
+            CellKind::Char(c) => self.font_slot_for_chars([*c]),
+            CellKind::Cluster(s) => self.font_slot_for_chars(s.chars()),
             _ => 0,
         }
     }
 
-    fn font_slot_for_chars<I>(&self, ctx: &mut dyn DrawingContext, chars: I) -> usize
+    fn font_slot_for_chars<I>(&self, chars: I) -> usize
     where
         I: IntoIterator<Item = char> + Clone,
     {
@@ -260,7 +237,7 @@ impl RowFonts {
                 .filter(|c| {
                     !c.is_control() && !is_zero_width_joiner(*c) && !is_variation_selector(*c)
                 })
-                .all(|c| self.font_supports(ctx, slot, c))
+                .all(|c| self.font_supports(slot, c))
             {
                 return slot;
             }
@@ -268,7 +245,7 @@ impl RowFonts {
         0
     }
 
-    fn font_supports(&self, ctx: &mut dyn DrawingContext, slot: usize, ch: char) -> bool {
+    fn font_supports(&self, slot: usize, ch: char) -> bool {
         if ch.is_ascii() {
             return true;
         }
@@ -277,37 +254,15 @@ impl RowFonts {
             return *supported;
         }
 
-        let supported = self.measure_support(ctx, slot, ch);
+        let supported = self.measure_support(slot, ch);
         self.support_cache.borrow_mut().insert(key, supported);
         supported
     }
 
-    fn measure_support(&self, ctx: &mut dyn DrawingContext, slot: usize, ch: char) -> bool {
-        let text = ch.to_string();
-        let Ok(metrics) = ctx.measure_text(&text, self.regular_font(slot)) else {
-            return false;
-        };
-        #[cfg(target_os = "macos")]
-        if slot > 0 && is_hangul_codepoint(ch) {
-            return metrics.advance > 0.1;
-        }
-        let Some(notdef_advance) = self.notdef_advance(ctx, slot) else {
-            return slot == 0 && !static_needs_fallback(ch);
-        };
-        metrics.advance > 0.1 && (metrics.advance - notdef_advance).abs() > 0.5
-    }
-
-    fn notdef_advance(&self, ctx: &mut dyn DrawingContext, slot: usize) -> Option<f32> {
-        if let Some(advance) = self.notdef_cache.borrow().get(&slot) {
-            return *advance;
-        }
-        let advance = ctx
-            .measure_text("\u{FFFE}", self.regular_font(slot))
-            .ok()
-            .map(|metrics| metrics.advance)
-            .filter(|advance| *advance > 0.1);
-        self.notdef_cache.borrow_mut().insert(slot, advance);
-        advance
+    /// Asks the face itself (aurea `font_covers`), so a font whose missing
+    /// glyph box is as wide as a real glyph is no longer mistaken.
+    fn measure_support(&self, slot: usize, ch: char) -> bool {
+        font_covers(self.regular_font(slot), ch).unwrap_or(slot == 0)
     }
 
     fn regular_font(&self, slot: usize) -> &Font {
@@ -325,56 +280,6 @@ fn is_variation_selector(c: char) -> bool {
 
 fn is_zero_width_joiner(c: char) -> bool {
     matches!(c as u32, 0x200C | 0x200D)
-}
-
-#[cfg(target_os = "macos")]
-fn is_hangul_codepoint(c: char) -> bool {
-    matches!(
-        c as u32,
-        0x1100..=0x11FF | 0x3130..=0x318F | 0xA960..=0xA97F | 0xAC00..=0xD7AF | 0xD7B0..=0xD7FF
-    )
-}
-
-/// Static Unicode ranges that are rarely present in Western monospace fonts.
-/// Checked on every character; the probe set supplements this for less obvious
-/// gaps specific to the user's chosen primary font.
-fn static_needs_fallback(c: char) -> bool {
-    let n = c as u32;
-    matches!(
-        n,
-        0x1100..=0x11FF     // Hangul Jamo
-        | 0x2100..=0x214F   // Letterlike Symbols
-        | 0x2200..=0x22FF   // Mathematical Operators
-        | 0x2300..=0x23FF   // Miscellaneous Technical
-        | 0x2460..=0x24FF   // Enclosed Alphanumerics
-        | 0x2500..=0x257F   // Box Drawing
-        | 0x2580..=0x259F   // Block Elements
-        | 0x25A0..=0x25FF   // Geometric Shapes
-        | 0x2600..=0x26FF   // Miscellaneous Symbols
-        | 0x2700..=0x27BF   // Dingbats
-        | 0x27C0..=0x27EF   // Supplemental Arrows-B / math
-        | 0x2800..=0x28FF   // Braille Patterns
-        | 0x2E80..=0x303F   // CJK Radicals, Kangxi, Symbols & Punctuation
-        | 0x3040..=0x9FFF   // Kana, Bopomofo, CJK unified block
-        | 0xA000..=0xA4CF   // Yi
-        | 0xA960..=0xA97F   // Hangul Jamo Extended-A
-        | 0xAC00..=0xD7FF   // Hangul Syllables + Jamo Extended-B
-        | 0xF900..=0xFAFF   // CJK Compatibility Ideographs
-        | 0xFE30..=0xFE4F   // CJK Compatibility Forms
-        | 0xFF00..=0xFFEF   // Halfwidth and Fullwidth Forms
-        // ── Supplementary Multilingual Plane ───────────────────────────────
-        | 0x1B000..=0x1B1FF // Kana Supplement + Kana Extended-A
-        | 0x1F000..=0x1F02F // Mahjong Tiles
-        | 0x1F0A0..=0x1F0FF // Playing Cards
-        | 0x1F200..=0x1F2FF // Enclosed CJK Letters and Months
-        | 0x1F300..=0x1FAFF // Emoji, pictographs, symbols (main block)
-        | 0x1FB00..=0x1FBFF // Symbols for Legacy Computing (block sextants, etc.)
-        // ── CJK Extension B–G (Supplementary Ideographic Plane) ───────────
-        | 0x20000..=0x2A6DF // CJK Extension B
-        | 0x2A700..=0x2CEAF // CJK Extension C / D / E
-        | 0x2CEB0..=0x2EBEF // CJK Extension F
-        | 0x30000..=0x3134F // CJK Extension G
-    )
 }
 
 fn prefers_fallback_font(c: char) -> bool {
@@ -504,7 +409,7 @@ fn draw_cell_text(
 
     let bold = cell.attrs.contains(Attrs::BOLD);
     let italic = cell.attrs.contains(Attrs::ITALIC);
-    let font_slot = fonts.font_slot_for_chars(ctx, text.chars());
+    let font_slot = fonts.font_slot_for_chars(text.chars());
     ctx.draw_text_with_font(
         &text,
         Point::new(x.round(), baseline.round()),
@@ -608,7 +513,7 @@ fn draw_row(
                 i = start;
             } else {
                 let x = cx(start);
-                let font_slot = fonts.font_slot_for_chars(ctx, text.chars());
+                let font_slot = fonts.font_slot_for_chars(text.chars());
                 ctx.draw_text_with_font(
                     &text,
                     Point::new(x, baseline.round()),
@@ -627,7 +532,7 @@ fn draw_row(
 
         let bold = row[i].attrs.contains(Attrs::BOLD);
         let italic = row[i].attrs.contains(Attrs::ITALIC);
-        let font_slot = fonts.font_slot_for_cell(ctx, &row[i]);
+        let font_slot = fonts.font_slot_for_cell(&row[i]);
         let start = i;
         let mut text = String::new();
         // Push the first cell (already known to match — avoids a duplicate
@@ -639,7 +544,7 @@ fn draw_row(
             && resolve_pair(&row[i], colors).0 == fg
             && row[i].attrs.contains(Attrs::BOLD) == bold
             && row[i].attrs.contains(Attrs::ITALIC) == italic
-            && fonts.font_slot_for_cell(ctx, &row[i]) == font_slot
+            && fonts.font_slot_for_cell(&row[i]) == font_slot
             && !cell_uses_grid_origin(&row[i])
             && !matches!(row[i].kind, CellKind::Continuation)
         {
@@ -663,8 +568,11 @@ fn draw_row(
 
     // Pass 4: underlines and strikethroughs
     // under the baseline, never past the bottom of the row
-    let ul_y = (baseline + 2.0).min(y_top + metrics.height - 3.0).round();
-    let st_y = baseline - metrics.ascent * 0.35;
+    let thick = metrics.underline_thickness.round().max(1.0);
+    let ul_y = (baseline + metrics.underline_offset)
+        .min(y_top + metrics.height - thick - 1.0)
+        .round();
+    let st_y = (baseline - metrics.strike_offset - thick / 2.0).round();
     for (i, cell) in row.iter().enumerate() {
         let x = cx(i);
         let w = cx(i + 1) - x;
@@ -673,11 +581,11 @@ fn draw_row(
                 TermColor::Default => resolve_pair(cell, colors).0,
                 other => colors.resolve(other, colors.foreground),
             };
-            draw_underline(ctx, cell.attrs, x, ul_y, w, ul_color)?;
+            draw_underline(ctx, cell.attrs, (x, ul_y, w, thick), ul_color)?;
         }
         if cell.attrs.contains(Attrs::STRIKE) {
             let (fg, _) = resolve_pair(cell, colors);
-            ctx.draw_rect(Rect::new(x, st_y, w, 1.0), &solid(fg))?;
+            ctx.draw_rect(Rect::new(x, st_y, w, thick), &solid(fg))?;
         }
     }
 
@@ -689,9 +597,7 @@ fn draw_row(
 fn draw_underline(
     ctx: &mut dyn DrawingContext,
     attrs: Attrs,
-    x: f32,
-    y: f32,
-    w: f32,
+    (x, y, w, thick): (f32, f32, f32, f32),
     color: Color,
 ) -> AureaResult<()> {
     let paint = solid(color);
@@ -706,26 +612,26 @@ fn draw_underline(
         let stroke = Paint {
             color,
             style: PaintStyle::Stroke,
-            stroke_width: 1.2,
+            stroke_width: thick.max(1.2),
             line_join: LineJoin::Round,
             ..Default::default()
         };
         ctx.draw_path(&path, &stroke)
     } else if attrs.contains(Attrs::DOUBLE_UNDERLINE) {
-        ctx.draw_rect(Rect::new(x, y - 1.0, w, 1.0), &paint)?;
-        ctx.draw_rect(Rect::new(x, y + 1.0, w, 1.0), &paint)
+        ctx.draw_rect(Rect::new(x, y - thick, w, thick), &paint)?;
+        ctx.draw_rect(Rect::new(x, y + thick, w, thick), &paint)
     } else if attrs.contains(Attrs::DOTTED_UNDERLINE) {
         let mut dot = x;
         while dot < x + w {
-            ctx.draw_rect(Rect::new(dot, y, 1.0, 1.0), &paint)?;
-            dot += 2.0;
+            ctx.draw_rect(Rect::new(dot, y, thick, thick), &paint)?;
+            dot += 2.0 * thick;
         }
         Ok(())
     } else if attrs.contains(Attrs::DASHED_UNDERLINE) {
-        ctx.draw_rect(Rect::new(x, y, w * 0.4, 1.0), &paint)?;
-        ctx.draw_rect(Rect::new(x + w * 0.5, y, w * 0.4, 1.0), &paint)
+        ctx.draw_rect(Rect::new(x, y, w * 0.4, thick), &paint)?;
+        ctx.draw_rect(Rect::new(x + w * 0.5, y, w * 0.4, thick), &paint)
     } else {
-        ctx.draw_rect(Rect::new(x, y, w, 1.0), &paint)
+        ctx.draw_rect(Rect::new(x, y, w, thick), &paint)
     }
 }
 
@@ -791,7 +697,7 @@ pub fn draw_grid(
                             if !text.trim().is_empty() {
                                 let bold = cell.attrs.contains(Attrs::BOLD);
                                 let italic = cell.attrs.contains(Attrs::ITALIC);
-                                let font_slot = fonts.font_slot_for_chars(ctx, text.chars());
+                                let font_slot = fonts.font_slot_for_chars(text.chars());
                                 let char_color = colors.resolve(cell.bg, colors.background);
                                 ctx.draw_text_with_font(
                                     &text,
@@ -915,7 +821,7 @@ fn draw_tab(
     } else {
         tab.text.clone()
     };
-    let slot = fonts.font_slot_for_chars(ctx, text.chars());
+    let slot = fonts.font_slot_for_chars(text.chars());
     let font = fonts.pick(false, false, slot);
     // cut long titles to the tab, with an ellipsis: grown from the start
     // while it fits
@@ -1004,7 +910,7 @@ pub fn draw_find_bar(
         &fonts.primary,
         &solid(theme::BAR_TEXT_DIM),
     )?;
-    let slot = fonts.font_slot_for_chars(ctx, query.chars());
+    let slot = fonts.font_slot_for_chars(query.chars());
     let font = fonts.pick(false, false, slot);
     let (shown, hint) = if query.is_empty() {
         ("find", true)
@@ -1061,7 +967,7 @@ pub fn draw_preedit(
     fonts: &RowFonts,
     colors: &Colors,
 ) -> AureaResult<()> {
-    let slot = fonts.font_slot_for_chars(ctx, text.chars());
+    let slot = fonts.font_slot_for_chars(text.chars());
     let font = fonts.pick(false, false, slot);
     let width = ctx
         .measure_text(text, font)
