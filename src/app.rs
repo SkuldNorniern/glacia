@@ -18,7 +18,7 @@ use crate::mouse::{self, Kind};
 use crate::render::{self, CellMetrics, Layout, RowFonts, SelectionRange, TabLabel};
 use crate::search::{RESEARCH_EVERY, Search};
 use crate::selection::{Selection, Spot, Unit};
-use crate::tabs::{self, Area, Dir, Node, Pane, Spawner};
+use crate::tabs::{self, Area, Dir, Divider, Node, Pane, Spawner};
 use crate::terminal::TerminalSession;
 use crate::theme::{self, Colors};
 use crate::{cell_metrics, row_fonts};
@@ -149,6 +149,8 @@ pub struct App {
     active: usize,
     /// The panes on show: id, area, and cell layout.
     areas: Vec<(usize, Area, Layout)>,
+    /// A line between panes being dragged.
+    dragging: Option<Divider>,
     spawn: Spawner,
     wake: Wake,
     /// The window title wants another look: output came, or the tab or
@@ -221,6 +223,7 @@ impl App {
             tabs: vec![(Node::Leaf(0), 0)],
             active: 0,
             areas: Vec::new(),
+            dragging: None,
             spawn,
             wake,
             retitle: true,
@@ -609,6 +612,27 @@ impl App {
             .collect()
     }
 
+    /// The line between panes under a window point, a few pixels either
+    /// side counting.
+    fn divider_at(&self, x: f64, y: f64) -> Option<Divider> {
+        if self.areas.len() < 2 {
+            return None;
+        }
+        let (w, h) = self.window_size;
+        let bar = self.bar_height() as f32;
+        let area = (0.0, bar, w as f32, h as f32 - bar);
+        let (x, y) = (x as f32, y as f32);
+        let slack = 3.0;
+        self.tabs[self.active]
+            .0
+            .dividers(area, PANE_GAP)
+            .into_iter()
+            .find(|d| {
+                let (lx, ly, lw, lh) = d.line;
+                x >= lx - slack && x < lx + lw + slack && y >= ly - slack && y < ly + lh + slack
+            })
+    }
+
     /// The pane under a window point, in the tab on show.
     fn pane_at(&self, x: f64, y: f64) -> Option<usize> {
         let (x, y) = (x as f32, y as f32);
@@ -719,6 +743,34 @@ impl App {
                         }
                         _ => {}
                     }
+                }
+            }
+            WindowEvent::MouseButton {
+                button: MouseButton::Left,
+                pressed: true,
+                x,
+                y,
+                ..
+            } if self.divider_at(*x, *y).is_some() => {
+                self.dragging = self.divider_at(*x, *y);
+            }
+            WindowEvent::MouseButton {
+                button: MouseButton::Left,
+                pressed: false,
+                ..
+            } if self.dragging.is_some() => {
+                self.dragging = None;
+            }
+            WindowEvent::MouseMove { x, y, .. } if self.dragging.is_some() => {
+                if let Some(line) = &self.dragging {
+                    let (px, py, pw, ph) = line.parent;
+                    let ratio = match line.dir {
+                        Dir::Right => (*x as f32 - px) / pw.max(1.0),
+                        Dir::Down => (*y as f32 - py) / ph.max(1.0),
+                    };
+                    let path = line.path.clone();
+                    self.tabs[self.active].0.set_ratio(&path, ratio);
+                    self.refit();
                 }
             }
             WindowEvent::MouseButton {
@@ -896,6 +948,18 @@ impl App {
             self.split(Dir::Right);
         } else if modifiers.alt && modifiers.shift && key == KeyCode::Minus {
             self.split(Dir::Down);
+        } else if let Some((dx, dy)) = arrow(key)
+            .filter(|_| modifiers.alt && modifiers.shift && !modifiers.ctrl && self.areas.len() > 1)
+        {
+            // alt+shift+arrows move the nearest line that way
+            let (dir, delta) = if dx != 0 {
+                (Dir::Right, f32::from(dx) * 0.05)
+            } else {
+                (Dir::Down, f32::from(dy) * 0.05)
+            };
+            if self.tabs[self.active].0.nudge(self.focused, dir, delta) {
+                self.refit();
+            }
         } else if let Some(arrow) = arrow(key).filter(|_| {
             modifiers.alt && !modifiers.ctrl && !modifiers.shift && self.areas.len() > 1
         }) {
