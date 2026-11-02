@@ -3,13 +3,15 @@
 //! never blocks startup — it falls back to defaults and reports a
 //! diagnostic instead.
 
+use std::fs::read_to_string;
 use std::fs::{create_dir_all, write as write_file};
-use std::fs::{metadata, read_to_string};
 use std::path::Path;
 use std::sync::mpsc::{Receiver, channel};
 use std::thread;
 use std::time::Duration;
 
+use aurea::Stamp;
+use aurea::render::Font;
 use toml::Table;
 use toml::Value;
 use toml::de::Error as TomlError;
@@ -54,7 +56,7 @@ pub struct FontConfig {
 impl Default for FontConfig {
     fn default() -> Self {
         Self {
-            family: platform::default_primary_font().to_owned(),
+            family: Font::monospace(14.0).family,
             fallbacks: Vec::new(),
             size: 14.0,
             line_height: 1.25,
@@ -158,11 +160,10 @@ pub fn watch(wake: impl Fn() + Send + 'static) -> Receiver<(Config, Option<Strin
         return rx;
     };
     thread::spawn(move || {
-        let stamp = |p: &Path| metadata(p).and_then(|m| m.modified()).ok();
-        let mut seen = stamp(&path);
+        let mut seen = Stamp::of(&path).ok();
         loop {
             thread::sleep(WATCH_EVERY);
-            let now = stamp(&path);
+            let now = Stamp::of(&path).ok();
             if now == seen {
                 continue;
             }
@@ -346,7 +347,7 @@ fn write_default_template(path: &Path) -> Option<String> {
         }
     }
 
-    let default_font = platform::default_primary_font();
+    let default_font = Font::monospace(14.0).family;
     let template = format!(
         "\
 # Glacia terminal emulator — configuration

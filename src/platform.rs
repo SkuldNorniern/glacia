@@ -107,24 +107,6 @@ pub fn terminal_env() -> Vec<(OsString, OsString)> {
     ]
 }
 
-/// Safe built-in primary monospace font for this platform.
-///
-/// Each choice ships with the OS and requires no extra installs. Users can
-/// override with `font.family` in `config.toml`.
-///
-/// - Windows: Consolas (since Vista)
-/// - macOS: Menlo (since 10.6)
-/// - Linux: DejaVu Sans Mono (standard on most distributions)
-pub fn default_primary_font() -> &'static str {
-    if cfg!(windows) {
-        "Consolas"
-    } else if cfg!(target_os = "macos") {
-        "Menlo"
-    } else {
-        "DejaVu Sans Mono"
-    }
-}
-
 /// Built-in font fallback cascade for scripts and symbols commonly missing
 /// from Western monospace faces. The renderer probes these at draw time and
 /// uses the first family that can cover a cell's text.

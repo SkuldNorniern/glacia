@@ -18,11 +18,8 @@ mod terminal;
 mod theme;
 mod unicode;
 
-use std::sync::{Arc, OnceLock};
-
 use aurea::render::{Canvas, Font, FontMetrics, RendererBackend, font_metrics, measure_text};
-use aurea::window::WindowProxy;
-use aurea::{AureaResult, Window, WindowEvent};
+use aurea::{AureaResult, Window, WindowEvent, wake_handle};
 
 use app::{App, DEFAULT_TITLE, grid_size};
 use config::Config;
@@ -71,8 +68,8 @@ fn attach_canvas(
 ) -> AureaResult<Canvas> {
     let canvas = Canvas::new(config.window.width, config.window.height, backend)?;
     // The loop redraws with `canvas.draw()`, but OS repaints such as the
-    // first paint need a callback too or the surface stays blank. Both clear
-    // to the background first, so no white frame shows.
+    // first paint need a callback too or parts of the surface stay white.
+    // Both clear to the background first, so no white frame shows.
     canvas.set_background_color(theme::BACKGROUND);
     canvas.set_draw_callback(|ctx| ctx.clear(theme::BACKGROUND))?;
     window.set_content(canvas.clone())?;
@@ -150,20 +147,12 @@ fn main() -> AureaResult<()> {
     // On macOS, fork() after GUI/canvas/font runtime initialization can leave
     // the child in a bad state. Spawn the PTY first, then resize it after exact
     // font metrics are known.
-    // The window doesn't exist yet when the shell starts; its proxy lands
-    // here once it does, and output wakes the event loop through it.
-    let proxy: Arc<OnceLock<WindowProxy>> = Arc::default();
+    // shell output wakes the loop; the window can come later, a wake waits
+    let wake = wake_handle();
     // every tab's shell starts here: the first now, more from the app
     let spawn: tabs::Spawner = {
-        let proxy = Arc::clone(&proxy);
         let start_dir = config.terminal.working_directory.clone();
         Box::new(move |cols, rows, dir: Option<&str>| {
-            let proxy = Arc::clone(&proxy);
-            let wake = move || {
-                if let Some(proxy) = proxy.get() {
-                    proxy.wake();
-                }
-            };
             TerminalSession::spawn(
                 SpawnOverrides {
                     cols,
@@ -173,7 +162,7 @@ fn main() -> AureaResult<()> {
                     env: platform::terminal_env(),
                     working_directory: dir.unwrap_or(&start_dir),
                 },
-                wake,
+                move || wake.wake(),
             )
         })
     };
@@ -184,7 +173,6 @@ fn main() -> AureaResult<()> {
         config.window.width as i32,
         config.window.height as i32,
     )?;
-    let _ = proxy.set(window.proxy());
     let mut canvas = open_canvas(&mut window, &config)?;
 
     let term = match term {
@@ -196,10 +184,5 @@ fn main() -> AureaResult<()> {
     };
     term.set_palette(theme::Colors::theme().palette());
 
-    let wake: app::Wake = Arc::new(move || {
-        if let Some(proxy) = proxy.get() {
-            proxy.wake();
-        }
-    });
     App::new(config, term, spawn, wake, metrics, fonts, diagnostics).run(&window, &mut canvas)
 }

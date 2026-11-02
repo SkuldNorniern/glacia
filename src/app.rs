@@ -2,12 +2,13 @@
 //! window events change it.
 
 use std::mem::take;
-use std::sync::Arc;
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::{Duration, Instant};
 
 use aurea::render::{Canvas, Color, DrawingContext, Paint, PaintStyle, Point, Rect};
-use aurea::{AureaResult, CursorIcon, KeyCode, Modifiers, MouseButton, Window, WindowEvent};
+use aurea::{
+    AureaResult, CursorIcon, KeyCode, Modifiers, MouseButton, WakeHandle, Window, WindowEvent,
+};
 use aurea::{clipboard_text, open_url, reduced_motion, set_clipboard_text, trim_memory};
 
 use vanta::{Cell, CursorStyle, Event, MouseTracking};
@@ -93,22 +94,8 @@ fn display_shell_name(raw: &str) -> &str {
     &base[..base.len() - 4]
 }
 
-/// Whether the wheel moved toward older lines. The sign differs per native
-/// backend: NSEvent (natural scroll) and WM_MOUSEWHEEL report positive for
-/// scrolling up, GTK reports negative for GDK_SCROLL_UP.
-fn wheel_scrolls_up(delta_y: f64) -> bool {
-    if cfg!(any(target_os = "macos", target_os = "windows")) {
-        delta_y > 0.0
-    } else {
-        delta_y < 0.0
-    }
-}
-
 /// A piece of a link on one row: row, first and last column.
 type LinkPiece = (usize, usize, usize);
-
-/// Wakes the event loop from another thread.
-pub type Wake = Arc<dyn Fn() + Send + Sync>;
 
 /// Takes new output into the view. Scrolled back, the view stays on the
 /// same lines while new ones come in; at the scrollback cap they show as
@@ -179,7 +166,7 @@ pub struct App {
     /// Where each tab is drawn; tabs slide to their slot after a move.
     tab_x: Vec<f32>,
     spawn: Spawner,
-    wake: Wake,
+    wake: WakeHandle,
     /// The window title wants another look: output came, or the tab or
     /// pane changed.
     retitle: bool,
@@ -238,16 +225,13 @@ impl App {
         config: Config,
         term: TerminalSession,
         spawn: Spawner,
-        wake: Wake,
+        wake: WakeHandle,
         metrics: CellMetrics,
         fonts: RowFonts,
         diagnostics: Vec<String>,
     ) -> Self {
         let now = Instant::now();
-        let config_changes = config::watch({
-            let wake = Arc::clone(&wake);
-            move || wake()
-        });
+        let config_changes = config::watch(move || wake.wake());
         let mut app = Self {
             window_size: (config.window.width, config.window.height),
             base_font_size: config.font.size,
@@ -1544,11 +1528,11 @@ impl App {
             let (tx, rx) = channel();
             search.pending = Some(rx);
             search.pending_gen = search.query_gen;
-            let wake = Arc::clone(&self.wake);
+            let wake = self.wake;
             self.term
                 .find_in_background(search.query.clone(), move |found| {
                     let _ = tx.send(found);
-                    wake();
+                    wake.wake();
                 });
         }
     }
@@ -1646,7 +1630,7 @@ impl App {
         if self.pane_at(px, py).is_some_and(|id| id != self.focused) {
             return;
         }
-        let up = wheel_scrolls_up(delta_y);
+        let up = delta_y > 0.0;
         let lines = (delta_y.abs() * 3.0).ceil() as usize;
         if self.app_takes_mouse(mods) {
             // tmux, vim and the rest with mouse on scroll themselves
