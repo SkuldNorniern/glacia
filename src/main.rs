@@ -13,6 +13,7 @@ mod plugin;
 mod render;
 mod search;
 mod selection;
+mod shortcuts;
 mod tabs;
 mod terminal;
 mod theme;

@@ -7,29 +7,6 @@ use aurea::{KeyCode, Modifiers};
 
 use crate::unicode::{compose_hangul_jamo, is_hangul_jamo};
 
-const APPLE: bool = cfg!(any(target_os = "macos", target_os = "ios"));
-
-/// The platform's shortcut key is down: Command on apple systems, Ctrl
-/// elsewhere. Links and font zoom use this one.
-pub fn shortcut_key(mods: Modifiers) -> bool {
-    if APPLE { mods.meta } else { mods.ctrl }
-}
-
-/// Glacia's own shortcuts: copy, paste, tabs, find. Command alone on apple
-/// systems, where Ctrl is the terminal's. Elsewhere plain Ctrl is the
-/// shell's too, so it takes Ctrl+Shift.
-pub fn app_chord(mods: Modifiers) -> bool {
-    chord_on(mods, APPLE)
-}
-
-fn chord_on(mods: Modifiers, apple: bool) -> bool {
-    if apple {
-        mods.meta && !mods.ctrl
-    } else {
-        mods.ctrl && mods.shift
-    }
-}
-
 /// Return the bytes to write to the PTY for a key press, or `None` if the key
 /// should be handled elsewhere (e.g. printable text via `TextInput`).
 ///
@@ -235,7 +212,7 @@ impl TextInputNormalizer {
 
 #[cfg(test)]
 mod tests {
-    use super::{TextInputNormalizer, chord_on, terminal_key_bytes};
+    use super::{TextInputNormalizer, terminal_key_bytes};
     use aurea::{KeyCode, Modifiers};
 
     fn key(key: KeyCode, shift: bool, ctrl: bool, alt: bool, app: bool) -> String {
@@ -270,25 +247,6 @@ mod tests {
         assert_eq!(key(KeyCode::F5, true, false, false, false), "\x1b[15;2~");
         assert_eq!(key(KeyCode::Enter, false, false, true, false), "\x1b\r");
         assert_eq!(key(KeyCode::Tab, true, false, false, false), "\x1b[Z");
-    }
-
-    #[test]
-    fn shortcuts_follow_the_platform() {
-        let mods = |ctrl, shift, meta| Modifiers {
-            ctrl,
-            shift,
-            meta,
-            ..Modifiers::default()
-        };
-        assert!(chord_on(mods(false, false, true), true), "cmd+c on a mac");
-        assert!(chord_on(mods(false, true, true), true), "cmd+shift+z");
-        assert!(
-            !chord_on(mods(true, true, false), true),
-            "ctrl+shift is the terminal's on a mac"
-        );
-        assert!(chord_on(mods(true, true, false), false));
-        assert!(!chord_on(mods(true, false, false), false), "ctrl+c is ^C");
-        assert!(!chord_on(mods(false, false, true), false), "the win key");
     }
 
     #[test]

@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 
 use aurea::render::{Canvas, Color, DrawingContext, Paint, PaintStyle, Point, Rect};
 use aurea::{
-    AureaResult, CursorIcon, KeyCode, Modifiers, MouseButton, WakeHandle, Window, WindowEvent,
+    AureaResult, Chord, CursorIcon, KeyCode, Keymap, Modifiers, MouseButton, WakeHandle, Window,
+    WindowEvent,
 };
 use aurea::{clipboard_text, open_url, reduced_motion, set_clipboard_text, trim_memory};
 
@@ -20,6 +21,7 @@ use crate::mouse::{self, Kind};
 use crate::render::{self, CellMetrics, Layout, RowFonts, SelectionRange, TabLabel};
 use crate::search::{RESEARCH_EVERY, Search};
 use crate::selection::{Selection, Spot, Unit};
+use crate::shortcuts::{self, Action};
 use crate::tabs::{self, Area, Bar, BarHit, Dir, Divider, Node, Pane, Side, Spawner};
 use crate::terminal::TerminalSession;
 use crate::theme::{self, Colors};
@@ -62,22 +64,6 @@ fn arrow(key: KeyCode) -> Option<(i8, i8)> {
         KeyCode::Down => (0, 1),
         _ => return None,
     })
-}
-
-/// Ctrl+Alt+1..9 picks a tab, Cmd+1..9 on a mac: the digit's index.
-fn tab_digit(key: KeyCode) -> Option<usize> {
-    let keys = [
-        KeyCode::Key1,
-        KeyCode::Key2,
-        KeyCode::Key3,
-        KeyCode::Key4,
-        KeyCode::Key5,
-        KeyCode::Key6,
-        KeyCode::Key7,
-        KeyCode::Key8,
-        KeyCode::Key9,
-    ];
-    keys.iter().position(|k| *k == key)
 }
 
 /// `cmd.exe`'s default, un-customized console title is its own full exe
@@ -212,6 +198,7 @@ pub struct App {
     last_blink: Instant,
     /// When output last arrived; the cursor holds still until the shell has
     /// been idle a full blink interval, so heavy output does not flicker it.
+    keymap: Keymap<Action>,
     last_output: Instant,
     /// When to trim, set by output, in any pane.
     settle_at: Option<Instant>,
@@ -283,6 +270,7 @@ impl App {
             caret: None,
             cursor_visible: true,
             last_blink: now,
+            keymap: shortcuts::keymap(),
             last_output: now,
             settle_at: None,
             last_render: now,
@@ -296,6 +284,8 @@ impl App {
 
     /// Runs until the window closes or the shell exits.
     pub fn run(mut self, window: &Window, canvas: &mut Canvas) -> AureaResult<()> {
+        // without it the keys still come, unless a child view holds them
+        let _ = self.keymap.install(window);
         loop {
             // Input and shell output (the reader wakes the window) end the
             // wait at once; otherwise it lasts until the next frame is due or
@@ -1112,10 +1102,7 @@ impl App {
                 y,
                 modifiers,
                 ..
-            } if input::shortcut_key(*modifiers)
-                && !modifiers.shift
-                && self.link_at(*x, *y).is_some() =>
-            {
+            } if modifiers.command() && !modifiers.shift && self.link_at(*x, *y).is_some() => {
                 // ctrl+click (cmd on a mac) opens a link, before the app or a
                 // selection. in an app that takes the mouse this press never
                 // reaches it; the click is glacia's
@@ -1206,7 +1193,8 @@ impl App {
                 x, y, modifiers, ..
             } => {
                 self.pointer = (*x, *y);
-                let link = input::shortcut_key(*modifiers)
+                let link = modifiers
+                    .command()
                     .then(|| self.link_at(*x, *y))
                     .flatten()
                     .map(|(pieces, _)| pieces)
@@ -1239,7 +1227,7 @@ impl App {
                 }
             }
             WindowEvent::KeyInput { modifiers, .. }
-                if !input::shortcut_key(*modifiers) && !take(&mut self.link_hover).is_empty() =>
+                if !modifiers.command() && !take(&mut self.link_hover).is_empty() =>
             {
                 self.needs_redraw = true;
                 if let WindowEvent::KeyInput {
@@ -1338,101 +1326,12 @@ impl App {
     }
 
     fn on_key(&mut self, key: KeyCode, modifiers: Modifiers) {
-        let chord = input::app_chord(modifiers);
-        let held = input::shortcut_key(modifiers);
-        let zoom = held && !modifiers.shift && !modifiers.alt;
-        // cmd+1..9 on a mac, ctrl+alt elsewhere
-        let picks_tab = if cfg!(any(target_os = "macos", target_os = "ios")) {
-            chord && !modifiers.shift
-        } else {
-            modifiers.ctrl && modifiers.alt
-        };
-        // cmd+shift+[ and ], the mac's way to change tabs
-        let bracket_tab = chord
-            && modifiers.shift
-            && !modifiers.ctrl
-            && matches!(key, KeyCode::LeftBracket | KeyCode::RightBracket);
-        // two presses before the loop applies the first add up
-        let size = self.zoom_to.unwrap_or(self.config.font.size);
-        if zoom && matches!(key, KeyCode::Equals | KeyCode::Minus | KeyCode::Key0) {
-            let next = match key {
-                KeyCode::Equals => size + 1.0,
-                KeyCode::Minus => size - 1.0,
-                _ => self.base_font_size,
-            };
-            self.zoom_to = Some(next.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE));
-        } else if chord && modifiers.shift && matches!(key, KeyCode::PageUp | KeyCode::PageDown) {
-            // ctrl+shift+pageup / pagedown move the tab left or right
-            let to = if key == KeyCode::PageUp {
-                self.active.checked_sub(1)
-            } else {
-                Some(self.active + 1).filter(|&i| i < self.tabs.len())
-            };
-            if let Some(to) = to {
-                self.tab_drag = None;
-                self.tabs.swap(self.active, to);
-                self.tab_x.swap(self.active, to);
-                self.active = to;
-                self.needs_redraw = true;
-            }
-        } else if chord && key == KeyCode::T {
-            self.new_tab();
-        } else if chord && key == KeyCode::W {
-            // the last pane stays: closing the window is the close button's job
-            self.close_pane(self.focused);
-        } else if chord
-            && modifiers.shift
-            && key == KeyCode::Z
-            && self.tabs[self.active].0.panes().len() > 1
-        {
-            // ctrl+shift+z: the pane fills the tab, and back
-            self.zoomed = !self.zoomed;
-            self.refit();
-        } else if modifiers.alt && modifiers.shift && key == KeyCode::Key0 {
-            // alt+shift+0: every split back to halves
-            self.tabs[self.active].0.equalize();
-            self.refit();
-        } else if modifiers.alt && modifiers.shift && key == KeyCode::Equals {
-            self.split(Dir::Right);
-        } else if modifiers.alt && modifiers.shift && key == KeyCode::Minus {
-            self.split(Dir::Down);
-        } else if modifiers.alt && modifiers.shift && !modifiers.ctrl && self.nudge_line(key) {
-            // a line between panes moved
-        } else if let Some(arrow) = arrow(key).filter(|_| {
-            modifiers.alt && !modifiers.ctrl && !modifiers.shift && self.areas.len() > 1
-        }) {
-            let areas: Vec<(usize, Area)> = self.areas.iter().map(|a| (a.0, a.1)).collect();
-            if let Some(id) = tabs::neighbour(&areas, self.focused, arrow) {
-                self.focus(id);
-            }
-        } else if (modifiers.ctrl && key == KeyCode::Tab || bracket_tab) && self.tabs.len() > 1 {
-            let n = self.tabs.len();
-            let back = if bracket_tab {
-                key == KeyCode::LeftBracket
-            } else {
-                modifiers.shift
-            };
-            let next = if back {
-                (self.active + n - 1) % n
-            } else {
-                (self.active + 1) % n
-            };
-            self.switch_tab(next);
-        } else if let Some(i) = tab_digit(key).filter(|_| picks_tab) {
-            // 9 is the last tab, like a browser
-            let i = if i == 8 { self.tabs.len() - 1 } else { i };
-            self.switch_tab(i);
-        } else if chord && key == KeyCode::F {
-            if self.search.take().is_none() {
-                self.search = Some(Search::default());
-            }
-            self.needs_redraw = true;
-        } else if self.search.is_some() && self.on_search_key(key, modifiers) {
+        let bound = self.keymap.action(Chord { key, modifiers }).copied();
+        if bound.is_some_and(|action| self.run_action(action)) {
+            return;
+        }
+        if self.search.is_some() && self.on_search_key(key, modifiers) {
             // the find bar took it
-        } else if chord && key == KeyCode::C {
-            self.copy_selection();
-        } else if chord && key == KeyCode::V {
-            self.paste();
         } else if modifiers.meta {
             // cmd or win with a key glacia has no use for: not the shell's
         } else if self.term.is_alt_screen() {
@@ -1442,6 +1341,101 @@ impl App {
             // scrollback is shift+page/home/end; plain ones go to the shell
             self.send_key(key, modifiers);
         }
+    }
+
+    /// Runs a shortcut. False when it has nothing to do here, like changing
+    /// tab with one tab, and the key goes on to the shell.
+    fn run_action(&mut self, action: Action) -> bool {
+        match action {
+            Action::ZoomIn | Action::ZoomOut | Action::ZoomReset => {
+                // two presses before the loop applies the first add up
+                let size = self.zoom_to.unwrap_or(self.config.font.size);
+                let next = match action {
+                    Action::ZoomIn => size + 1.0,
+                    Action::ZoomOut => size - 1.0,
+                    _ => self.base_font_size,
+                };
+                self.zoom_to = Some(next.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE));
+            }
+            Action::MoveTab(back) => {
+                let to = if back {
+                    self.active.checked_sub(1)
+                } else {
+                    Some(self.active + 1).filter(|&i| i < self.tabs.len())
+                };
+                if let Some(to) = to {
+                    self.tab_drag = None;
+                    self.tabs.swap(self.active, to);
+                    self.tab_x.swap(self.active, to);
+                    self.active = to;
+                    self.needs_redraw = true;
+                }
+            }
+            Action::NewTab => self.new_tab(),
+            Action::ClosePane => {
+                // the last pane stays: closing the window is the close button's job
+                self.close_pane(self.focused);
+            }
+            Action::ZoomPane => {
+                if self.tabs[self.active].0.panes().len() < 2 {
+                    return false;
+                }
+                self.zoomed = !self.zoomed;
+                self.refit();
+            }
+            Action::EvenSplits => {
+                self.tabs[self.active].0.equalize();
+                self.refit();
+            }
+            Action::SplitRight => self.split(Dir::Right),
+            Action::SplitDown => self.split(Dir::Down),
+            Action::NudgeLine(key) => return self.nudge_line(key),
+            Action::FocusPane(key) => {
+                let Some(step) = arrow(key).filter(|_| self.areas.len() > 1) else {
+                    return false;
+                };
+                let areas: Vec<(usize, Area)> = self.areas.iter().map(|a| (a.0, a.1)).collect();
+                if let Some(id) = tabs::neighbour(&areas, self.focused, step) {
+                    self.focus(id);
+                }
+            }
+            Action::CycleTab(back) => {
+                let n = self.tabs.len();
+                if n < 2 {
+                    return false;
+                }
+                let next = if back {
+                    (self.active + n - 1) % n
+                } else {
+                    (self.active + 1) % n
+                };
+                self.switch_tab(next);
+            }
+            Action::PickTab(i) => {
+                // 9 is the last tab, like a browser
+                let i = if i == 8 { self.tabs.len() - 1 } else { i };
+                self.switch_tab(i);
+            }
+            Action::Find => {
+                if self.search.take().is_none() {
+                    self.search = Some(Search::default());
+                }
+                self.needs_redraw = true;
+            }
+            Action::Copy => self.copy_selection(),
+            Action::Paste => match &mut self.search {
+                Some(search) => {
+                    if let Some(text) = clipboard_text() {
+                        let line = text.lines().next().unwrap_or_default().to_owned();
+                        search.query.push_str(&line);
+                        self.find();
+                    }
+                    self.needs_redraw = true;
+                }
+                None => self.paste(),
+            },
+        }
+        true
     }
 
     /// Keys while the find bar is open: Enter steps to older matches,
@@ -1465,13 +1459,6 @@ impl App {
             KeyCode::Backspace => {
                 search.query.pop();
                 self.find();
-            }
-            KeyCode::V if input::app_chord(mods) => {
-                if let Some(text) = clipboard_text() {
-                    let line = text.lines().next().unwrap_or_default().to_owned();
-                    search.query.push_str(&line);
-                    self.find();
-                }
             }
             _ if mods.ctrl || mods.alt || mods.meta => return false,
             KeyCode::PageUp | KeyCode::PageDown | KeyCode::Home | KeyCode::End => return false,
