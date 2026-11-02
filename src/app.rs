@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use aurea::render::{Canvas, Color, DrawingContext, Paint, PaintStyle, Point, Rect};
 use aurea::{AureaResult, CursorIcon, KeyCode, Modifiers, MouseButton, Window, WindowEvent};
-use aurea::{clipboard_text, open_url, reduced_motion, set_clipboard_text};
+use aurea::{clipboard_text, open_url, reduced_motion, set_clipboard_text, trim_memory};
 
 use vanta::{Cell, CursorStyle, Event, MouseTracking};
 
@@ -140,6 +140,9 @@ const DIAGNOSTICS_FOR: Duration = Duration::from_secs(10);
 
 /// How often a shell whose output ended is checked for its exit.
 const REAP_EVERY: Duration = Duration::from_millis(50);
+/// How long output stays quiet before aurea's text caches go. Lines that
+/// scrolled past are in there and won't show again.
+const SETTLE_FOR: Duration = Duration::from_secs(3);
 
 /// The line between split panes.
 const PANE_GAP: f32 = 1.0;
@@ -223,6 +226,8 @@ pub struct App {
     /// When output last arrived; the cursor holds still until the shell has
     /// been idle a full blink interval, so heavy output does not flicker it.
     last_output: Instant,
+    /// When to trim, set by output, in any pane.
+    settle_at: Option<Instant>,
     last_render: Instant,
     last_title: Option<String>,
     needs_redraw: bool,
@@ -295,6 +300,7 @@ impl App {
             cursor_visible: true,
             last_blink: now,
             last_output: now,
+            settle_at: None,
             last_render: now,
             last_title: None,
             needs_redraw: true,
@@ -350,6 +356,14 @@ impl App {
                 }
                 (t, None) => t,
             };
+            // the caches go once things are quiet
+            let timeout = match self.settle_at {
+                Some(at) => {
+                    let left = at.saturating_duration_since(Instant::now());
+                    Some(timeout.map_or(left, |t| t.min(left)))
+                }
+                None => timeout,
+            };
             let mut close = false;
             for event in window.wait_events(timeout) {
                 close |= self.on_event(&event);
@@ -384,6 +398,10 @@ impl App {
             self.follow_canvas_size(canvas);
             self.pump_shell();
             self.pump_panes();
+            if self.settle_at.is_some_and(|at| Instant::now() >= at) {
+                self.settle_at = None;
+                trim_memory();
+            }
             // a shell that exited takes its pane with it; the last one, the window
             if !self.term.is_running() && !self.close_pane(self.focused) {
                 return Ok(());
@@ -649,6 +667,7 @@ impl App {
             if !follow(&mut pane.term, &mut pane.scroll_offset) {
                 continue;
             }
+            self.settle_at = Some(Instant::now() + SETTLE_FOR);
             if pane.term.palette_version() != pane.palette_version {
                 pane.palette_version = pane.term.palette_version();
                 pane.colors = Colors::from_palette(&pane.term.palette());
@@ -1692,6 +1711,7 @@ impl App {
             }
             self.wake_cursor();
             self.last_output = Instant::now();
+            self.settle_at = Some(self.last_output + SETTLE_FOR);
             self.take_events();
             if self.term.palette_version() != self.palette_version {
                 self.palette_version = self.term.palette_version();
