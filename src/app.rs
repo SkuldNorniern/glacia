@@ -63,7 +63,7 @@ fn arrow(key: KeyCode) -> Option<(i8, i8)> {
     })
 }
 
-/// Ctrl+Alt+1..9 picks a tab: the digit's index.
+/// Ctrl+Alt+1..9 picks a tab, Cmd+1..9 on a mac: the digit's index.
 fn tab_digit(key: KeyCode) -> Option<usize> {
     let keys = [
         KeyCode::Key1,
@@ -1128,10 +1128,13 @@ impl App {
                 y,
                 modifiers,
                 ..
-            } if modifiers.ctrl && !modifiers.shift && self.link_at(*x, *y).is_some() => {
-                // ctrl+click opens a link, before the app or a selection
-                // in an app that takes the mouse this press never reaches it;
-                // ctrl+click is glacia's
+            } if input::shortcut_key(*modifiers)
+                && !modifiers.shift
+                && self.link_at(*x, *y).is_some() =>
+            {
+                // ctrl+click (cmd on a mac) opens a link, before the app or a
+                // selection. in an app that takes the mouse this press never
+                // reaches it; the click is glacia's
                 if let Some((_, url)) = self.link_at(*x, *y) {
                     let _ = open_url(&url);
                 }
@@ -1219,8 +1222,7 @@ impl App {
                 x, y, modifiers, ..
             } => {
                 self.pointer = (*x, *y);
-                let link = modifiers
-                    .ctrl
+                let link = input::shortcut_key(*modifiers)
                     .then(|| self.link_at(*x, *y))
                     .flatten()
                     .map(|(pieces, _)| pieces)
@@ -1253,7 +1255,7 @@ impl App {
                 }
             }
             WindowEvent::KeyInput { modifiers, .. }
-                if !modifiers.ctrl && !take(&mut self.link_hover).is_empty() =>
+                if !input::shortcut_key(*modifiers) && !take(&mut self.link_hover).is_empty() =>
             {
                 self.needs_redraw = true;
                 if let WindowEvent::KeyInput {
@@ -1352,8 +1354,20 @@ impl App {
     }
 
     fn on_key(&mut self, key: KeyCode, modifiers: Modifiers) {
-        let copy_paste = modifiers.ctrl && modifiers.shift;
-        let zoom = modifiers.ctrl && !modifiers.shift && !modifiers.alt;
+        let chord = input::app_chord(modifiers);
+        let held = input::shortcut_key(modifiers);
+        let zoom = held && !modifiers.shift && !modifiers.alt;
+        // cmd+1..9 on a mac, ctrl+alt elsewhere
+        let picks_tab = if cfg!(any(target_os = "macos", target_os = "ios")) {
+            chord && !modifiers.shift
+        } else {
+            modifiers.ctrl && modifiers.alt
+        };
+        // cmd+shift+[ and ], the mac's way to change tabs
+        let bracket_tab = chord
+            && modifiers.shift
+            && !modifiers.ctrl
+            && matches!(key, KeyCode::LeftBracket | KeyCode::RightBracket);
         // two presses before the loop applies the first add up
         let size = self.zoom_to.unwrap_or(self.config.font.size);
         if zoom && matches!(key, KeyCode::Equals | KeyCode::Minus | KeyCode::Key0) {
@@ -1363,7 +1377,7 @@ impl App {
                 _ => self.base_font_size,
             };
             self.zoom_to = Some(next.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE));
-        } else if copy_paste && matches!(key, KeyCode::PageUp | KeyCode::PageDown) {
+        } else if chord && modifiers.shift && matches!(key, KeyCode::PageUp | KeyCode::PageDown) {
             // ctrl+shift+pageup / pagedown move the tab left or right
             let to = if key == KeyCode::PageUp {
                 self.active.checked_sub(1)
@@ -1377,12 +1391,16 @@ impl App {
                 self.active = to;
                 self.needs_redraw = true;
             }
-        } else if copy_paste && key == KeyCode::T {
+        } else if chord && key == KeyCode::T {
             self.new_tab();
-        } else if copy_paste && key == KeyCode::W {
+        } else if chord && key == KeyCode::W {
             // the last pane stays: closing the window is the close button's job
             self.close_pane(self.focused);
-        } else if copy_paste && key == KeyCode::Z && self.tabs[self.active].0.panes().len() > 1 {
+        } else if chord
+            && modifiers.shift
+            && key == KeyCode::Z
+            && self.tabs[self.active].0.panes().len() > 1
+        {
             // ctrl+shift+z: the pane fills the tab, and back
             self.zoomed = !self.zoomed;
             self.refit();
@@ -1403,29 +1421,36 @@ impl App {
             if let Some(id) = tabs::neighbour(&areas, self.focused, arrow) {
                 self.focus(id);
             }
-        } else if modifiers.ctrl && key == KeyCode::Tab && self.tabs.len() > 1 {
+        } else if (modifiers.ctrl && key == KeyCode::Tab || bracket_tab) && self.tabs.len() > 1 {
             let n = self.tabs.len();
-            let next = if modifiers.shift {
+            let back = if bracket_tab {
+                key == KeyCode::LeftBracket
+            } else {
+                modifiers.shift
+            };
+            let next = if back {
                 (self.active + n - 1) % n
             } else {
                 (self.active + 1) % n
             };
             self.switch_tab(next);
-        } else if let Some(i) = tab_digit(key).filter(|_| modifiers.ctrl && modifiers.alt) {
-            // ctrl+alt+9 is the last tab, like a browser
+        } else if let Some(i) = tab_digit(key).filter(|_| picks_tab) {
+            // 9 is the last tab, like a browser
             let i = if i == 8 { self.tabs.len() - 1 } else { i };
             self.switch_tab(i);
-        } else if copy_paste && key == KeyCode::F {
+        } else if chord && key == KeyCode::F {
             if self.search.take().is_none() {
                 self.search = Some(Search::default());
             }
             self.needs_redraw = true;
         } else if self.search.is_some() && self.on_search_key(key, modifiers) {
             // the find bar took it
-        } else if copy_paste && key == KeyCode::C {
+        } else if chord && key == KeyCode::C {
             self.copy_selection();
-        } else if copy_paste && key == KeyCode::V {
+        } else if chord && key == KeyCode::V {
             self.paste();
+        } else if modifiers.meta {
+            // cmd or win with a key glacia has no use for: not the shell's
         } else if self.term.is_alt_screen() {
             // the app owns scrolling: every key goes to it
             self.send_key(key, modifiers);
@@ -1457,14 +1482,14 @@ impl App {
                 search.query.pop();
                 self.find();
             }
-            KeyCode::V if mods.ctrl && mods.shift => {
+            KeyCode::V if input::app_chord(mods) => {
                 if let Some(text) = clipboard_text() {
                     let line = text.lines().next().unwrap_or_default().to_owned();
                     search.query.push_str(&line);
                     self.find();
                 }
             }
-            _ if mods.ctrl || mods.alt => return false,
+            _ if mods.ctrl || mods.alt || mods.meta => return false,
             KeyCode::PageUp | KeyCode::PageDown | KeyCode::Home | KeyCode::End => return false,
             // the rest are typed, as text input
             _ => {}
