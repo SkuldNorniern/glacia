@@ -19,3 +19,14 @@ toml = "0.9"
 [build-dependencies]
 winres = "0.1"
 
+
+# zengpu past 0.1.0, as aurea patches it. drop after its next release
+[patch.crates-io]
+zengpu = { git = "https://github.com/SkuldNorniern/ZenGPU", rev = "849dac707244639a065fa335072e340fe1b95737" }
+zengpu-hal = { git = "https://github.com/SkuldNorniern/ZenGPU", rev = "849dac707244639a065fa335072e340fe1b95737" }
+zengpu-vulkan = { git = "https://github.com/SkuldNorniern/ZenGPU", rev = "849dac707244639a065fa335072e340fe1b95737" }
+zengpu-metal = { git = "https://github.com/SkuldNorniern/ZenGPU", rev = "849dac707244639a065fa335072e340fe1b95737" }
+zengpu-shader = { git = "https://github.com/SkuldNorniern/ZenGPU", rev = "849dac707244639a065fa335072e340fe1b95737" }
+zengpu-zsl = { git = "https://github.com/SkuldNorniern/ZenGPU", rev = "849dac707244639a065fa335072e340fe1b95737" }
+zengpu-zslc = { git = "https://github.com/SkuldNorniern/ZenGPU", rev = "849dac707244639a065fa335072e340fe1b95737" }
+zengpu-spv = { git = "https://github.com/SkuldNorniern/ZenGPU", rev = "849dac707244639a065fa335072e340fe1b95737" }
